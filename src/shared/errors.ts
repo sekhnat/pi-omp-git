@@ -1,7 +1,11 @@
 /**
  * Stable, friendly error messages and the error taxonomy base classes.
  * Tool-facing surfaces show `message` only — never stack traces, never
- * echoed tokens (docs/pi-omp-git-reference.md §49).
+ * echoed tokens (docs/pi-omp-git-reference.md §49, §90).
+ *
+ * GitHub taxonomy correspondence (§90): DependencyError ≙
+ * GithubUnavailableError, AuthenticationError ≙ GithubAuthError,
+ * NoRepositoryContextError ≙ GithubRepoResolutionError, GithubApiError.
  */
 
 export const FRIENDLY_ERRORS = {
@@ -53,6 +57,9 @@ export class InvalidJsonError extends PiOmpGitError {
 		super(message);
 	}
 }
+
+/** A GitHub API request failed (HTTP error, rate limit, malformed response). */
+export class GithubApiError extends PiOmpGitError {}
 
 /** Map an availability probe failure into the thrown form GitHub surfaces use. */
 export function ensureAvailable(

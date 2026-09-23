@@ -1,9 +1,10 @@
 /**
- * pi-omp-git extension entry — tickets 01–03. The `read` override routes
- * virtual GitHub URIs through the cache; everything else delegates to
- * Pi's native read with zero behavior change. The `github` model tool
- * arrives in ticket 08. No processes start at load; probes and the
- * cache database open lazily on first use.
+ * pi-omp-git extension entry — tickets 01–03 and 08. The `read` override
+ * routes virtual GitHub URIs through the cache; everything else delegates
+ * to Pi's native read with zero behavior change. The `github` dispatcher
+ * tool serves repo_view and file_read (later tickets activate the rest of
+ * the §18 surface). No processes start at load; probes and the cache
+ * database open lazily on first use.
  */
 
 import { homedir } from "node:os";
@@ -18,6 +19,8 @@ import {
 import { credentialFingerprint } from "./github/cache/auth-key.ts";
 import { createGithubCache, type GithubCache } from "./github/cache/cache.ts";
 import { openCacheStore } from "./github/cache/db.ts";
+import { createGithubTool } from "./github/dispatcher.ts";
+import { GITHUB_PROMPT_GUIDELINES } from "./github/prompt-guidelines.ts";
 import {
 	createGithubReadOverride,
 	type GithubReadOverride,
@@ -37,6 +40,7 @@ export interface OmpGitContext {
 	getConfig: () => ResolvedConfig;
 	nativeRead: ReturnType<typeof createReadTool>;
 	readOverride: GithubReadOverride;
+	githubTool: ReturnType<typeof createGithubTool>;
 	setProjectTrusted(trusted: boolean): void;
 }
 
@@ -69,6 +73,12 @@ export function createOmpGitContext(cwd?: string): OmpGitContext {
 		getConfig,
 		nativeRead,
 	});
+	const githubTool = createGithubTool({
+		gh,
+		git,
+		availability,
+		env: process.env,
+	});
 	return {
 		runner,
 		gh,
@@ -78,6 +88,7 @@ export function createOmpGitContext(cwd?: string): OmpGitContext {
 		getConfig,
 		nativeRead,
 		readOverride,
+		githubTool,
 		setProjectTrusted: (trusted: boolean): void => {
 			projectTrusted = trusted;
 		},
@@ -102,6 +113,19 @@ export default function piOmpGitExtension(pi: ExtensionAPI): void {
 		async execute(toolCallId, params, signal, onUpdate) {
 			return ctx.readOverride.execute(toolCallId, params, signal, onUpdate);
 		},
+	});
+
+	// `github` dispatcher (ticket 08): repo_view and file_read now; the rest
+	// of the §18 surface arrives in later tickets with clear errors meanwhile.
+	pi.registerTool(ctx.githubTool);
+
+	// Prompt guidance (§59) rides the system-prompt build hook so the agent
+	// prefers these surfaces over curl/wget and scraping — appended as
+	// guideline bullets, never a rewritten prompt.
+	pi.on("before_agent_start", (event) => {
+		event.systemPromptOptions.promptGuidelines.push(
+			...GITHUB_PROMPT_GUIDELINES,
+		);
 	});
 
 	pi.registerCommand("omp-git-doctor", {

@@ -108,6 +108,38 @@ export function parseGitRemoteUrl(url: string): ParsedRemote | null {
 	return null;
 }
 
+export interface ParsedRepoIdentifier {
+	host?: string;
+	owner: string;
+	repo: string;
+}
+
+/**
+ * Parse the §19 repository identifier forms:
+ *
+ *   owner/repo
+ *   host/owner/repo
+ *
+ * Returns null for anything else (empty segments, URLs, single words).
+ * Use this for explicit `repo` tool parameters — distinct from
+ * `parseGitRemoteUrl`, which covers git remote URL spellings.
+ */
+export function parseGithubRepoIdentifier(
+	identifier: string,
+): ParsedRepoIdentifier | null {
+	const trimmed = identifier.trim();
+	if (!trimmed) return null;
+	const segments = trimmed.split("/");
+	if (segments.length === 2) {
+		const [owner, repo] = segments as [string, string];
+		return owner && repo ? { owner, repo } : null;
+	}
+	if (segments.length === 3) {
+		const [host, owner, repo] = segments as [string, string, string];
+		return host && owner && repo ? { host, owner, repo } : null;
+	}
+	return null;
+}
 function splitOwnerRepo(rest: string): { owner: string; repo: string } | null {
 	const segments = rest.split("/").filter((segment) => segment !== "");
 	if (segments.length < 2) return null;

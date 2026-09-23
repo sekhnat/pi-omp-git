@@ -42,6 +42,8 @@ export interface GhFixture {
 	stdout?: string;
 	stderr?: string;
 	exitCode?: number;
+	/** The runner's output cap cut the recorded output. */
+	truncated?: boolean;
 }
 
 export type GhFixtureMap = Record<string, GhFixture>;
