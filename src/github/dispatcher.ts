@@ -9,12 +9,17 @@
  * from the message alone — no stack traces, no echoed tokens (§49).
  */
 
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type {
+	AgentToolResult,
+	AgentToolUpdateCallback,
+} from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
 import type { GitRunner } from "../git/runner.ts";
 import { PiOmpGitError } from "../shared/errors.ts";
 import type { Availability } from "./availability.ts";
+import type { NestedModel, NestedSessionFactory } from "./nested-agent.ts";
 import { fetchFileRead } from "./operations/file-read.ts";
+import { createPullRequest } from "./operations/pr-create.ts";
 import { fetchRepoView, renderRepoView } from "./operations/repo-view.ts";
 import {
 	fetchSearch,
@@ -124,6 +129,50 @@ export const GithubToolParams = Type.Object({
 				"Maximum results (search_* operations). Default 10, maximum 50.",
 		}),
 	),
+	title: Type.Optional(
+		Type.String({
+			description: "PR title (pr_create). Mutually exclusive with fill.",
+		}),
+	),
+	body: Type.Optional(
+		Type.String({
+			description:
+				"PR body (pr_create). Empty string is valid; a nonempty body travels through a temporary file.",
+		}),
+	),
+	base: Type.Optional(
+		Type.String({
+			description:
+				"Target base branch (pr_create). Defaults to gh's inference.",
+		}),
+	),
+	head: Type.Optional(
+		Type.String({
+			description: "Head branch (pr_create). Defaults to the current branch.",
+		}),
+	),
+	draft: Type.Optional(
+		Type.Boolean({ description: "Create the PR as a draft (pr_create)." }),
+	),
+	fill: Type.Optional(
+		Type.Boolean({
+			description:
+				"Generate title and body from the change via a nested agent session (pr_create). Mutually exclusive with title and body.",
+		}),
+	),
+	reviewer: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Requested reviewers (pr_create).",
+		}),
+	),
+	assignee: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Requested assignees (pr_create).",
+		}),
+	),
+	label: Type.Optional(
+		Type.Array(Type.String(), { description: "Labels to apply (pr_create)." }),
+	),
 });
 
 export type GithubToolArguments = Static<typeof GithubToolParams>;
@@ -141,6 +190,17 @@ export interface GithubToolDetails {
 	limit?: number;
 	/** Search: the GitHub-reported total before the limit. */
 	total?: number;
+	/** pr_create: the canonical PR URL and number, when created. */
+	url?: string;
+	number?: number;
+}
+
+/** The slice of Pi's tool context the dispatcher consumes. */
+export interface GithubToolContext {
+	/** The parent session's model (nested agents inherit it, §75). */
+	model?: NestedModel;
+	/** The session's working directory (nested agents run there). */
+	cwd?: string;
 }
 
 export interface GithubToolDeps {
@@ -148,6 +208,10 @@ export interface GithubToolDeps {
 	git: GitRunner;
 	availability: Availability;
 	env: NodeJS.ProcessEnv;
+	/** Test seam for the nested agent session factory (§75). */
+	createNestedSession?: NestedSessionFactory;
+	/** Body-file directory override (tests inject a stable path). */
+	tempDir?: string;
 }
 
 export interface GithubTool {
@@ -159,6 +223,8 @@ export interface GithubTool {
 		toolCallId: string,
 		params: GithubToolArguments,
 		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<GithubToolDetails>,
+		ctx?: GithubToolContext,
 	): Promise<AgentToolResult<GithubToolDetails>>;
 }
 
@@ -167,8 +233,9 @@ const TOOL_DESCRIPTION = `GitHub operations through one dispatcher. Uses the aut
 Operations:
 - repo_view: repository metadata (description, URL, default branch, visibility, permission, language, stars, forks, archived/fork status, topics).
 - file_read: a file from a GitHub repository — text decoded, images returned as image content, other binaries as metadata with the GitHub source URL.
+- pr_create: create a pull request with an explicit title, or fill: true to generate title and body from the change via a nested agent session.
 - search_issues / search_prs / search_code / search_commits / search_repos: GitHub searches — GitHub query syntax reaches the API unaltered; results render agent-useful fields with canonical URLs. Issues/PRs/code/commits scope to the current checkout unless the query already declares repo:/org:/user:/owner: scope.
-(Upcoming operations: pr_create, pr_checkout, pr_push, run_watch.)
+(Upcoming operations: pr_checkout, pr_push, run_watch.)
 
 Use repo_view to orient in an unfamiliar repository, file_read instead of curl/wget for files stored in GitHub repositories, and the search_* operations instead of scraping pages.`;
 
@@ -201,6 +268,9 @@ export function validateGithubArguments(params: unknown): GithubToolArguments {
 		"query",
 		"since",
 		"until",
+		"title",
+		"base",
+		"head",
 	] as const) {
 		const value = record[field];
 		if (value === undefined || value === null) continue;
@@ -228,6 +298,39 @@ export function validateGithubArguments(params: unknown): GithubToolArguments {
 		}
 		validated.limit = record.limit;
 	}
+	// pr_create's body may be explicitly empty (noninteractive, §22) —
+	// type-checked but not emptiness-checked.
+	if (record.body !== undefined && record.body !== null) {
+		if (typeof record.body !== "string") {
+			throw new GithubParamsError(
+				"The `body` parameter must be a string (empty is allowed).",
+			);
+		}
+		validated.body = record.body;
+	}
+	for (const field of ["draft", "fill"] as const) {
+		const value = record[field];
+		if (value === undefined || value === null) continue;
+		if (typeof value !== "boolean") {
+			throw new GithubParamsError(
+				`The \`${field}\` parameter must be a boolean.`,
+			);
+		}
+		validated[field] = value;
+	}
+	for (const field of ["reviewer", "assignee", "label"] as const) {
+		const value = record[field];
+		if (value === undefined || value === null) continue;
+		if (
+			!Array.isArray(value) ||
+			value.some((item) => typeof item !== "string" || item.trim() === "")
+		) {
+			throw new GithubParamsError(
+				`The \`${field}\` parameter must be an array of non-empty strings.`,
+			);
+		}
+		validated[field] = value;
+	}
 	if (
 		SEARCH_OPERATIONS.includes(
 			operation as (typeof SEARCH_OPERATIONS)[number],
@@ -246,6 +349,7 @@ export async function executeGithubOperation(
 	deps: GithubToolDeps,
 	params: GithubToolArguments,
 	signal?: AbortSignal,
+	ctx?: GithubToolContext,
 ): Promise<{
 	content: AgentToolResult<GithubToolDetails>["content"];
 	details: GithubToolDetails;
@@ -308,6 +412,41 @@ export async function executeGithubOperation(
 				},
 			};
 		}
+		case "pr_create": {
+			const created = await createPullRequest(
+				{
+					gh: deps.gh,
+					git: deps.git,
+					cwd: ctx?.cwd ?? process.cwd(),
+					model: ctx?.model,
+					createNestedSession: deps.createNestedSession,
+					tempDir: deps.tempDir,
+				},
+				{
+					repo: params.repo,
+					title: params.title,
+					body: params.body,
+					base: params.base,
+					head: params.head,
+					draft: params.draft,
+					fill: params.fill,
+					reviewer: params.reviewer,
+					assignee: params.assignee,
+					label: params.label,
+				},
+				signal,
+			);
+			return {
+				content: [{ type: "text", text: created.summary }],
+				details: {
+					op: "pr_create",
+					repo: params.repo,
+					url: created.url,
+					number: created.number,
+				},
+			};
+		}
+
 		default: {
 			if (!(SEARCH_OPERATIONS as readonly string[]).includes(params.op)) {
 				throw new GithubParamsError(
@@ -349,9 +488,9 @@ export function createGithubTool(deps: GithubToolDeps): GithubTool {
 		label: "github",
 		description: TOOL_DESCRIPTION,
 		parameters: GithubToolParams,
-		async execute(_toolCallId, params, signal) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const validated = validateGithubArguments(params);
-			return executeGithubOperation(deps, validated, signal);
+			return executeGithubOperation(deps, validated, signal, ctx);
 		},
 	};
 }

@@ -155,7 +155,10 @@ describe("github dispatcher validation", () => {
 
 	it("reports unimplemented operations clearly", async () => {
 		const { tool } = buildTool();
-		await expect(callGithub(tool, { op: "pr_create" })).rejects.toThrow(
+		await expect(callGithub(tool, { op: "pr_checkout" })).rejects.toThrow(
+			/not available in this build/i,
+		);
+		await expect(callGithub(tool, { op: "pr_push" })).rejects.toThrow(
 			/not available in this build/i,
 		);
 		await expect(callGithub(tool, { op: "run_watch" })).rejects.toThrow(
