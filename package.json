@@ -1,0 +1,33 @@
+{
+	"name": "pi-omp-git",
+	"version": "0.0.1",
+	"description": "OMP Git/GitHub parity package for upstream Pi",
+	"type": "module",
+	"keywords": [
+		"pi-package"
+	],
+	"license": "MIT",
+	"engines": {
+		"node": ">=22.19"
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"test": "vitest run",
+		"typecheck": "tsc --noEmit",
+		"lint": "biome check ."
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2",
+		"@types/node": "^26.1.2",
+		"typescript": "^5.9.0",
+		"vitest": "^4.1.11"
+	}
+}
