@@ -1,11 +1,11 @@
 /**
- * The `read` override — tickets 02–05 (docs/pi-omp-git-reference.md §7).
+ * The `read` override — tickets 02–06 (docs/pi-omp-git-reference.md §7).
  *
  * `issue://` and `pr://` scheme URIs route to the GitHub resource
  * machinery; everything else delegates to Pi's native read with zero
  * behavior change. The result shape (content blocks + ReadToolDetails)
  * matches the native read, so pagination discipline carries over.
- * PR diff resources are implemented in ticket 05. Listing forms remain
+ * PR diff resources are implemented in tickets 05–06. Listing forms remain
  * explicit not-implemented-yet errors until ticket 07.
  *
  * Since ticket 03, single-issue reads flow through the cache facade:
@@ -35,7 +35,6 @@ import {
 	fetchPrDiff,
 	PR_DIFF_UPDATED_NOTICE,
 	parseCachedPrDiff,
-	parseUnifiedDiff,
 	renderPrDiff,
 } from "./diffs.ts";
 import { fetchIssue } from "./issues.ts";
@@ -193,8 +192,8 @@ export async function readGithubResource(
 				comments: false,
 			};
 			const live = async (): Promise<string> => {
-				const unifiedDiff = await fetchPrDiff(deps.gh, target, signal);
-				return JSON.stringify(parseUnifiedDiff(unifiedDiff));
+				const diff = await fetchPrDiff(deps.gh, target, signal);
+				return JSON.stringify(diff);
 			};
 			let outcome = await deps.cache.readThrough(cacheIdentity, live, signal);
 			let diff: ReturnType<typeof parseCachedPrDiff>;

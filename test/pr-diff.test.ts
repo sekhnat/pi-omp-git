@@ -1,8 +1,7 @@
 /**
- * Ticket 05 acceptance tests: cached PR diff primary resources (§15–§16).
- * The three virtual views share one parsed/cached unified diff and preserve
- * string-index section boundaries, native read pagination, and row-version
- * notices across reads.
+ * Tickets 05–06 acceptance tests: cached PR diff resources (§§15–§17).
+ * The primary and fallback paths share one normalized diff and preserve
+ * string-index section boundaries, native pagination, and row-version notices.
  */
 
 import { mkdtempSync } from "node:fs";
@@ -82,6 +81,10 @@ const MULTI_DIFF =
 	MODIFIED_DIFF + ADDED_DIFF + DELETED_DIFF + RENAMED_DIFF + BINARY_DIFF;
 const DIFF_ARGS = "gh pr diff 123 --color never --repo owner/repo";
 
+const filesApiArgs = (page: number) =>
+	`gh api repos/owner/repo/pulls/123/files?per_page=100&page=${page}`;
+const PULL_DETAIL_ARGS =
+	"gh api repos/owner/repo/pulls/123 --jq .changed_files";
 function buildDeps(
 	fixtureOverrides: GhFixtureMap = {},
 	options: { now?: () => number; ghHost?: string } = {},
@@ -95,6 +98,7 @@ function buildDeps(
 	};
 	const calls: string[] = [];
 	const diffHosts: string[] = [];
+	const apiHosts: string[] = [];
 	const exec: Exec = async (spec) => {
 		const key = [spec.command, ...spec.args].join(" ");
 		calls.push(key);
@@ -104,6 +108,9 @@ function buildDeps(
 			spec.args[1] === "diff"
 		) {
 			diffHosts.push(spec.env.GH_HOST ?? "");
+		}
+		if (spec.command === "gh" && spec.args[0] === "api") {
+			apiHosts.push(spec.env.GH_HOST ?? "");
 		}
 		const fixture = fixtures[key];
 		if (!fixture) throw new Error(`No fixture recorded for argv: ${key}`);
@@ -154,7 +161,27 @@ function buildDeps(
 			}),
 		nativeRead,
 	});
-	return { calls, diffHosts, fixtures, override };
+	return { calls, diffHosts, apiHosts, fixtures, override };
+}
+
+function limitFallbackFixtures(changedFiles: number): GhFixtureMap {
+	const fixtures: GhFixtureMap = {
+		[DIFF_ARGS]: { exitCode: 1, stderr: "HTTP 406: diff is too large" },
+		[PULL_DETAIL_ARGS]: { stdout: String(changedFiles), exitCode: 0 },
+	};
+	for (let page = 1; page <= 30; page++) {
+		const pageFiles = Array.from({ length: 100 }, (_, index) => ({
+			filename: `file-${(page - 1) * 100 + index}.txt`,
+			status: "modified",
+			additions: 0,
+			deletions: 0,
+		}));
+		fixtures[filesApiArgs(page)] = {
+			stdout: JSON.stringify(pageFiles),
+			exitCode: 0,
+		};
+	}
+	return fixtures;
 }
 
 const readVirtual = (override: GithubReadOverride, params: ReadToolParams) =>
@@ -268,6 +295,142 @@ describe("PR diff virtual resources", () => {
 		expect(oneFile).toBe(MODIFIED_DIFF);
 		expect(all).toBe(MULTI_DIFF);
 		expect(calls.filter((call) => call === DIFF_ARGS)).toHaveLength(1);
+	});
+
+	it("falls back on aggregate HTTP 406 and serves deterministic views including unavailable patches", async () => {
+		const apiFiles = [
+			{
+				filename: "z.txt",
+				status: "modified",
+				additions: 1,
+				deletions: 1,
+				patch: "@@ -1 +1 @@\n-old\n+new",
+			},
+			{ filename: "m.bin", status: "modified", additions: 0, deletions: 0 },
+			{
+				filename: "new-name.ts",
+				previous_filename: "old-name.ts",
+				status: "renamed",
+				additions: 1,
+				deletions: 1,
+				patch: "@@ -1 +1 @@\n-old-name\n+new-name",
+			},
+			{
+				filename: "gone.txt",
+				status: "removed",
+				additions: 0,
+				deletions: 1,
+				patch: "@@ -1 +0,0 @@\n-gone",
+			},
+			{
+				filename: "a-new.txt",
+				status: "added",
+				additions: 1,
+				deletions: 0,
+				patch: "@@ -0,0 +1 @@\n+hello",
+			},
+		];
+		const { calls, override } = buildDeps({
+			[DIFF_ARGS]: { exitCode: 1, stderr: "HTTP 406: diff is too large" },
+			[PULL_DETAIL_ARGS]: { stdout: "5", exitCode: 0 },
+			[filesApiArgs(1)]: { stdout: JSON.stringify(apiFiles), exitCode: 0 },
+		});
+		const index = textOf(
+			await readVirtual(override, { path: "pr://owner/repo/123/diff" }),
+		);
+		const missingPatch = textOf(
+			await readVirtual(override, { path: "pr://owner/repo/123/diff/3" }),
+		);
+		const patchedFile = textOf(
+			await readVirtual(override, { path: "pr://owner/repo/123/diff/5" }),
+		);
+		const all = textOf(
+			await readVirtual(override, { path: "pr://owner/repo/123/diff/all" }),
+		);
+		expect(index.indexOf("1. `a-new.txt`")).toBeLessThan(
+			index.indexOf("2. `gone.txt`"),
+		);
+		expect(index.indexOf("2. `gone.txt`")).toBeLessThan(
+			index.indexOf("3. `m.bin`"),
+		);
+		expect(index.indexOf("3. `m.bin`")).toBeLessThan(
+			index.indexOf("4. `new-name.ts`"),
+		);
+		expect(index.indexOf("4. `new-name.ts`")).toBeLessThan(
+			index.indexOf("5. `z.txt`"),
+		);
+		expect(index).toContain("Patch unavailable from GitHub for this file.");
+		expect(index).toContain("renamed from `old-name.ts`");
+		expect(index).toContain("deleted");
+		expect(missingPatch).toContain(
+			"Patch unavailable from GitHub for this file.",
+		);
+		expect(patchedFile).toContain("-old\n+new");
+		expect(all).toContain("+hello");
+		expect(all).toContain("Patch unavailable from GitHub for this file.");
+		expect(all).toContain("-old\n+new");
+		expect(calls.filter((call) => call === DIFF_ARGS)).toHaveLength(1);
+		expect(calls.filter((call) => call === filesApiArgs(1))).toHaveLength(1);
+		expect(calls.filter((call) => call === PULL_DETAIL_ARGS)).toHaveLength(1);
+	});
+
+	it("passes GH_HOST to both API requests in the fallback path", async () => {
+		const { apiHosts, override } = buildDeps(
+			{
+				[DIFF_ARGS]: { exitCode: 1, stderr: "HTTP 406" },
+				[PULL_DETAIL_ARGS]: { stdout: "1", exitCode: 0 },
+				[filesApiArgs(1)]: {
+					stdout: JSON.stringify([
+						{
+							filename: "one.txt",
+							status: "modified",
+							additions: 0,
+							deletions: 0,
+						},
+					]),
+					exitCode: 0,
+				},
+			},
+			{ ghHost: "github.example.com" },
+		);
+		await readVirtual(override, { path: "pr://owner/repo/123/diff" });
+		expect(apiHosts).toEqual(["github.example.com", "github.example.com"]);
+	});
+
+	it("does not invoke fallback for unrelated aggregate-diff failures", async () => {
+		const { calls, override } = buildDeps({
+			[DIFF_ARGS]: { exitCode: 1, stderr: "HTTP 404: pull request not found" },
+		});
+		await expect(
+			readVirtual(override, { path: "pr://owner/repo/123/diff/all" }),
+		).rejects.toThrow(/not found/);
+		expect(
+			calls.some((call) =>
+				call.startsWith("gh api repos/owner/repo/pulls/123/files"),
+			),
+		).toBe(false);
+	});
+
+	it("accepts exactly 3,000 files when PR metadata confirms the listing is complete", async () => {
+		const { calls, override } = buildDeps(limitFallbackFixtures(3_000));
+		const index = textOf(
+			await readVirtual(override, { path: "pr://owner/repo/123/diff" }),
+		);
+		expect(index).toContain("Changed files: 3000");
+		expect(calls).toContain(PULL_DETAIL_ARGS);
+	});
+
+	it("fails honestly when the changed-file count exceeds 3,000", async () => {
+		const { calls, override } = buildDeps(limitFallbackFixtures(3_001));
+		await expect(
+			readVirtual(override, { path: "pr://owner/repo/123/diff" }),
+		).rejects.toThrow(/PR #123.*3,000/);
+		expect(
+			calls.filter((call) =>
+				call.startsWith("gh api repos/owner/repo/pulls/123/files"),
+			),
+		).toHaveLength(0);
+		expect(calls).toContain(PULL_DETAIL_ARGS);
 	});
 
 	it("resolves explicit repository identity without local repo resolution", async () => {

@@ -1,18 +1,22 @@
 /**
- * Primary `pr://N/diff` fetch, parser, normalized cache shape, and views
- * (docs/pi-omp-git-reference.md §15–§16; ticket 05).
+ * Primary and fallback `pr://N/diff` fetch, normalized cache shape, and views
+ * (docs/pi-omp-git-reference.md §§15–§17; tickets 05–06).
  *
- * The fetched unified diff is retained verbatim. File boundaries and slices
- * use JavaScript string indices (UTF-16 code units), so all three views can
- * be derived from one cache row without byte-offset corruption.
+ * The primary unified diff is retained verbatim; fallback sections are
+ * synthesized deterministically from API file patches. Boundaries and slices
+ * use JavaScript string indices (UTF-16 code units).
  */
 
 import {
 	DependencyError,
 	FRIENDLY_ERRORS,
+	InvalidJsonError,
 	PiOmpGitError,
 } from "../../shared/errors.ts";
-import { CommandNotFoundError } from "../../shared/subprocess.ts";
+import {
+	CommandNotFoundError,
+	type RunResult,
+} from "../../shared/subprocess.ts";
 import type { GhRunner } from "../runner.ts";
 import { classifyPullFailure, type PullTarget, runOptions } from "./prs.ts";
 
@@ -24,6 +28,7 @@ export interface DiffFileIndex {
 	additions?: number;
 	deletions?: number;
 	binary: boolean;
+	patchUnavailable?: boolean;
 	/** UTF-16 code-unit offset into `CachedPrDiff.unifiedDiff`. */
 	startIndex: number;
 	/** Exclusive UTF-16 code-unit offset into `CachedPrDiff.unifiedDiff`. */
@@ -33,6 +38,19 @@ export interface DiffFileIndex {
 export interface CachedPrDiff {
 	unifiedDiff: string;
 	files: DiffFileIndex[];
+}
+
+const FILES_PER_PAGE = 100;
+const MAX_CHANGED_FILES = 3_000;
+const PATCH_UNAVAILABLE_MARKER = "Patch unavailable from GitHub for this file.";
+
+interface PullRequestDiffFile {
+	filename: string;
+	previousFilename?: string;
+	status: string;
+	additions: number;
+	deletions: number;
+	patch?: string;
 }
 
 export const PR_DIFF_UPDATED_NOTICE =
@@ -50,33 +68,237 @@ export function prDiffArgs(target: PullTarget): string[] {
 	];
 }
 
-/** Fetch the authoritative unified diff through the central gh runner. */
+/** Fetch the aggregate diff, falling back to paginated per-file patches on HTTP 406. */
 export async function fetchPrDiff(
 	gh: GhRunner,
 	target: PullTarget,
 	signal?: AbortSignal,
-): Promise<string> {
-	let result: Awaited<ReturnType<GhRunner["run"]>>;
-	try {
-		result = await gh.run(prDiffArgs(target), {
-			signal,
-			...runOptions(target),
-		});
-	} catch (error) {
-		if (error instanceof CommandNotFoundError) {
-			throw new DependencyError(FRIENDLY_ERRORS.ghMissing, "gh");
-		}
-		throw error;
-	}
+): Promise<CachedPrDiff> {
+	const result = await runGh(gh, target, prDiffArgs(target), signal);
 	if (result.truncated) {
 		throw new PiOmpGitError(
 			"GitHub pull request diff output exceeded the process output limit and was truncated.",
 		);
 	}
 	if (result.exitCode !== 0) {
+		if (isAggregateDiffRejection(result)) {
+			return fetchFallbackPrDiff(gh, target, signal);
+		}
 		throw classifyPullFailure(target, result);
 	}
-	return result.stdout;
+	return parseUnifiedDiff(result.stdout);
+}
+
+async function runGh(
+	gh: GhRunner,
+	target: PullTarget,
+	args: string[],
+	signal?: AbortSignal,
+): Promise<RunResult> {
+	try {
+		return await gh.run(args, { signal, ...runOptions(target) });
+	} catch (error) {
+		if (error instanceof CommandNotFoundError) {
+			throw new DependencyError(FRIENDLY_ERRORS.ghMissing, "gh");
+		}
+		throw error;
+	}
+}
+
+function isAggregateDiffRejection(result: RunResult): boolean {
+	return /\b(?:HTTP\s+)?406\b/i.test(result.stderr);
+}
+
+function requireSuccessfulGhResult(
+	target: PullTarget,
+	result: RunResult,
+	truncatedMessage: string,
+): void {
+	if (result.truncated) throw new PiOmpGitError(truncatedMessage);
+	if (result.exitCode !== 0) throw classifyPullFailure(target, result);
+}
+
+function perFileArgs(target: PullTarget, page: number): string[] {
+	return [
+		"api",
+		`repos/${target.owner}/${target.repo}/pulls/${target.number}/files?per_page=${FILES_PER_PAGE}&page=${page}`,
+	];
+}
+
+function changedFileCountArgs(target: PullTarget): string[] {
+	return [
+		"api",
+		`repos/${target.owner}/${target.repo}/pulls/${target.number}`,
+		"--jq",
+		".changed_files",
+	];
+}
+
+async function fetchFallbackPrDiff(
+	gh: GhRunner,
+	target: PullTarget,
+	signal?: AbortSignal,
+): Promise<CachedPrDiff> {
+	// Check the uncapped total so the 3,000-row list cap can't look complete.
+	const changedFileCount = await fetchChangedFileCount(gh, target, signal);
+	if (changedFileCount > MAX_CHANGED_FILES) throw changedFileLimitError(target);
+	const files: PullRequestDiffFile[] = [];
+	for (let page = 1; files.length < changedFileCount; page++) {
+		const result = await runGh(gh, target, perFileArgs(target, page), signal);
+		requireSuccessfulGhResult(
+			target,
+			result,
+			`PR #${target.number} changed-file fallback response for page ${page} exceeded the process output limit.`,
+		);
+		const pageFiles = parsePerFilePage(result.stdout);
+		if (pageFiles.length === 0) break;
+		files.push(...pageFiles);
+	}
+	if (files.length !== changedFileCount) {
+		throw new PiOmpGitError(
+			`PR #${target.number} reports ${changedFileCount} changed files, but GitHub's per-file API returned ${files.length}; refusing an incomplete fallback.`,
+		);
+	}
+	files.sort(compareDiffFiles);
+	return synthesizeFallbackDiff(files);
+}
+
+async function fetchChangedFileCount(
+	gh: GhRunner,
+	target: PullTarget,
+	signal?: AbortSignal,
+): Promise<number> {
+	const result = await runGh(gh, target, changedFileCountArgs(target), signal);
+	requireSuccessfulGhResult(
+		target,
+		result,
+		`PR #${target.number} changed-file count response exceeded the process output limit.`,
+	);
+	const countText = result.stdout.trim();
+	const count = Number(countText);
+	if (!/^\d+$/.test(countText) || !Number.isSafeInteger(count)) {
+		throw new InvalidJsonError();
+	}
+	return count;
+}
+
+function changedFileLimitError(target: PullTarget): PiOmpGitError {
+	return new PiOmpGitError(
+		`PR #${target.number} exceeds GitHub's 3,000-file per-file API limit; the fallback cannot return a complete diff.`,
+	);
+}
+
+function parsePerFilePage(stdout: string): PullRequestDiffFile[] {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(stdout);
+	} catch {
+		throw new InvalidJsonError();
+	}
+	if (!Array.isArray(parsed)) throw new InvalidJsonError();
+	return parsed.map((value) => {
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			throw new InvalidJsonError();
+		}
+		const file = value as Record<string, unknown>;
+		if (
+			typeof file.filename !== "string" ||
+			typeof file.status !== "string" ||
+			typeof file.additions !== "number" ||
+			!Number.isInteger(file.additions) ||
+			file.additions < 0 ||
+			typeof file.deletions !== "number" ||
+			!Number.isInteger(file.deletions) ||
+			file.deletions < 0
+		) {
+			throw new InvalidJsonError();
+		}
+		return {
+			filename: file.filename,
+			previousFilename:
+				typeof file.previous_filename === "string"
+					? file.previous_filename
+					: undefined,
+			status: file.status,
+			additions: file.additions,
+			deletions: file.deletions,
+			patch:
+				typeof file.patch === "string" && file.patch.length > 0
+					? file.patch
+					: undefined,
+		};
+	});
+}
+
+function compareDiffFiles(
+	left: PullRequestDiffFile,
+	right: PullRequestDiffFile,
+): number {
+	if (left.filename < right.filename) return -1;
+	if (left.filename > right.filename) return 1;
+	const leftOld = left.previousFilename ?? "";
+	const rightOld = right.previousFilename ?? "";
+	if (leftOld < rightOld) return -1;
+	if (leftOld > rightOld) return 1;
+	return left.status < right.status ? -1 : left.status > right.status ? 1 : 0;
+}
+
+function synthesizeFallbackDiff(files: PullRequestDiffFile[]): CachedPrDiff {
+	const unifiedDiff = files.map(synthesizeFilePatch).join("");
+	const parsed = parseUnifiedDiff(unifiedDiff);
+	return {
+		unifiedDiff,
+		files: parsed.files.map((file, index) => ({
+			...file,
+			additions: files[index]?.additions ?? file.additions,
+			deletions: files[index]?.deletions ?? file.deletions,
+		})),
+	};
+}
+
+function synthesizeFilePatch(file: PullRequestDiffFile): string {
+	const status =
+		file.status === "added" ||
+		file.status === "removed" ||
+		file.status === "renamed"
+			? file.status
+			: "modified";
+	const oldPath = file.previousFilename ?? file.filename;
+	const lines = [
+		`diff --git ${quoteGitPath(`a/${oldPath}`)} ${quoteGitPath(`b/${file.filename}`)}`,
+	];
+	if (status === "added") lines.push("new file mode 100644");
+	if (status === "removed") lines.push("deleted file mode 100644");
+	if (status === "renamed") {
+		lines.push(`rename from ${quoteGitPath(oldPath)}`);
+		lines.push(`rename to ${quoteGitPath(file.filename)}`);
+	}
+	lines.push(
+		status === "added"
+			? "--- /dev/null"
+			: `--- ${quoteGitPath(`a/${oldPath}`)}`,
+		status === "removed"
+			? "+++ /dev/null"
+			: `+++ ${quoteGitPath(`b/${file.filename}`)}`,
+	);
+	if (file.patch)
+		lines.push(...file.patch.replaceAll("\r\n", "\n").split("\n"));
+	else lines.push(PATCH_UNAVAILABLE_MARKER);
+	return `${lines.join("\n")}\n`;
+}
+
+function quoteGitPath(path: string): string {
+	let quoted = '"';
+	for (const byte of Buffer.from(path, "utf8")) {
+		if (byte === 0x22) quoted += '\\"';
+		else if (byte === 0x5c) quoted += "\\\\";
+		else if (byte === 0x09) quoted += "\\t";
+		else if (byte === 0x0a) quoted += "\\n";
+		else if (byte === 0x0d) quoted += "\\r";
+		else if (byte >= 0x20 && byte < 0x7f) quoted += String.fromCharCode(byte);
+		else quoted += `\\${byte.toString(8).padStart(3, "0")}`;
+	}
+	return `${quoted}"`;
 }
 
 /** Parse file sections in source order, retaining exact section offsets. */
@@ -163,6 +385,7 @@ function parseDiffFile(
 		additions,
 		deletions,
 		binary,
+		patchUnavailable: lines.includes(PATCH_UNAVAILABLE_MARKER),
 		startIndex,
 		endIndex,
 	};
@@ -321,6 +544,8 @@ export function parseCachedPrDiff(content: string): CachedPrDiff {
 			!Number.isInteger(file.endIndex) ||
 			file.startIndex < 0 ||
 			file.startIndex > file.endIndex ||
+			(file.patchUnavailable !== undefined &&
+				typeof file.patchUnavailable !== "boolean") ||
 			file.endIndex > diff.unifiedDiff.length
 		) {
 			throw new PiOmpGitError(
@@ -371,6 +596,7 @@ function renderDiffIndex(diff: CachedPrDiff, pullNumber: number): string {
 		} else if (file.additions !== undefined && file.deletions !== undefined) {
 			description += ` (+${file.additions} -${file.deletions})`;
 		}
+		if (file.patchUnavailable) description += ` (${PATCH_UNAVAILABLE_MARKER})`;
 		lines.push(`${file.index}. ${path} — ${description}`);
 	}
 	return lines.join("\n");
