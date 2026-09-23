@@ -6,8 +6,18 @@
 
 **Status:** ready-for-agent
 
-- [ ] A `bash` tool result containing a recognized mutation verb invalidates the relevant rows before execution, even when the command fails
-- [ ] Interactive `!` commands are observed through the same mechanism
-- [ ] Narrow invalidation applies when host/repo/number are identifiable; whole-repository invalidation otherwise
-- [ ] Parsing never executes or reinterprets the command string
-- [ ] The full verb list from the specification is covered by tests
+- [x] A `bash` tool result containing a recognized mutation verb invalidates the relevant rows before execution, even when the command fails
+- [x] Interactive `!` commands are observed through the same mechanism
+- [x] Narrow invalidation applies when host/repo/number are identifiable; whole-repository invalidation otherwise
+- [x] Parsing never executes or reinterprets the command string
+- [x] The full verb list from the specification is covered by tests
+
+## Comments
+
+**Implemented**: `src/github/invalidation.ts` (`detectGhMutations` heuristic —
+never executes the command; full issue/PR verb lists; `-R`/`--repo` and URL
+targets; number extraction) and `createGhMutationInvalidator` (narrow
+per-resource invalidation when host/repo/number are identifiable,
+whole-repository otherwise). Wired in `src/index.ts` on the `tool_call`
+(bash/powershell) and `user_bash` events, invalidating BEFORE execution.
+Tests: `test/gh-mutation-invalidation.test.ts`.

@@ -6,10 +6,21 @@
 
 **Status:** ready-for-agent
 
-- [ ] Missing branch metadata produces the deterministic metadata error; no contributor-branch guessing
-- [ ] Resolution order: explicit parameter → last checkout (survives session resume) → current-branch metadata → error; arrays are rejected
-- [ ] The pushed ref is exactly the PR head ref; checked-out branches push from HEAD, others from the branch ref
-- [ ] `forceWithLease` maps to `--force-with-lease`; plain `--force` is never used
-- [ ] A successful push invalidates the PR's cached PR and PR-diff rows
-- [ ] Remote rejection is surfaced as an error, never converted to a force push
-- [ ] Pushes work for current and non-current PR branches, same-repo and fork PRs
+- [x] Missing branch metadata produces the deterministic metadata error; no contributor-branch guessing
+- [x] Resolution order: explicit parameter → last checkout (survives session resume) → current-branch metadata → error; arrays are rejected
+- [x] The pushed ref is exactly the PR head ref; checked-out branches push from HEAD, others from the branch ref
+- [x] `forceWithLease` maps to `--force-with-lease`; plain `--force` is never used
+- [x] A successful push invalidates the PR's cached PR and PR-diff rows
+- [x] Remote rejection is surfaced as an error, never converted to a force push
+- [x] Pushes work for current and non-current PR branches, same-repo and fork PRs
+
+## Comments
+
+**Implemented**: `src/github/operations/pr-push.ts` (resolution explicit
+`pr`/`branch` → session last checkout → current-branch metadata → error;
+deterministic `PrMetadataMissingError`; exact refspec `<source>:refs/heads/<ompPrHeadRef>`
+with HEAD only when the branch is checked out; `--force-with-lease` only;
+remote rejection surfaced, never forced; successful push invalidates pr +
+pr-diff rows both comment modes) and `src/github/last-checkout.ts`
+(transcript-derived record; survives resume via `pi.appendEntry` +
+`sessionManager.getBranch()`). Tests: `test/pr-push.test.ts` (real git).

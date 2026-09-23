@@ -9,17 +9,32 @@
  * from the message alone — no stack traces, no echoed tokens (§49).
  */
 
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
+import {
+	createMutationLock,
+	type RepositoryMutationLock,
+} from "../git/mutation-lock.ts";
 import type { GitRunner } from "../git/runner.ts";
 import { PiOmpGitError } from "../shared/errors.ts";
 import type { Availability } from "./availability.ts";
+import type { GithubCache } from "./cache/cache.ts";
+import type { CheckoutRecord } from "./last-checkout.ts";
 import type { NestedModel, NestedSessionFactory } from "./nested-agent.ts";
 import { fetchFileRead } from "./operations/file-read.ts";
+import {
+	checkoutPullRequests,
+	type PrCheckoutFailure,
+	type PrCheckoutItem,
+	renderPrCheckout,
+} from "./operations/pr-checkout.ts";
 import { createPullRequest } from "./operations/pr-create.ts";
+import { pushPullRequest } from "./operations/pr-push.ts";
 import { fetchRepoView, renderRepoView } from "./operations/repo-view.ts";
 import {
 	fetchSearch,
@@ -173,6 +188,24 @@ export const GithubToolParams = Type.Object({
 	label: Type.Optional(
 		Type.Array(Type.String(), { description: "Labels to apply (pr_create)." }),
 	),
+	pr: Type.Optional(
+		Type.Union([Type.String(), Type.Array(Type.String())], {
+			description:
+				"PR identifier for pr_checkout/pr_push: a number as a string, a PR URL, or a branch-like identifier. Arrays batch pr_checkout only. JSON numbers are rejected.",
+		}),
+	),
+	force: Type.Optional(
+		Type.Boolean({
+			description:
+				"pr_checkout: reset an existing wrong-SHA pr-N branch to the PR head (D2). Never a silent reset without it.",
+		}),
+	),
+	forceWithLease: Type.Optional(
+		Type.Boolean({
+			description:
+				"pr_push: push with --force-with-lease. Plain --force does not exist in this surface.",
+		}),
+	),
 });
 
 export type GithubToolArguments = Static<typeof GithubToolParams>;
@@ -190,9 +223,23 @@ export interface GithubToolDetails {
 	limit?: number;
 	/** Search: the GitHub-reported total before the limit. */
 	total?: number;
-	/** pr_create: the canonical PR URL and number, when created. */
+	/** pr_create/pr_push: the canonical PR URL and number, when known. */
 	url?: string;
 	number?: number;
+	/** pr_checkout: the managed worktree path (prominent, §110). */
+	worktreePath?: string;
+	/** pr_checkout: the local pr-N branch. */
+	prBranch?: string;
+	/** pr_checkout: an existing checkout was reused rather than created. */
+	reused?: boolean;
+	/** pr_checkout: all successful checkouts (batch carries every one). */
+	checkouts?: PrCheckoutItem[];
+	/** pr_checkout: structured per-PR failures (§24, D4). */
+	failures?: PrCheckoutFailure[];
+	/** pr_push: how the target resolved (§110). */
+	resolvedBy?: string;
+	/** pr_push: the remote the branch was pushed to. */
+	pushRemote?: string;
 }
 
 /** The slice of Pi's tool context the dispatcher consumes. */
@@ -201,6 +248,8 @@ export interface GithubToolContext {
 	model?: NestedModel;
 	/** The session's working directory (nested agents run there). */
 	cwd?: string;
+	/** The session's most recent pr_checkout record (§110 resolution). */
+	getLastCheckout?: () => CheckoutRecord | null;
 }
 
 export interface GithubToolDeps {
@@ -212,6 +261,12 @@ export interface GithubToolDeps {
 	createNestedSession?: NestedSessionFactory;
 	/** Body-file directory override (tests inject a stable path). */
 	tempDir?: string;
+	/** Cache rows invalidated after confirmed mutations (§33, §57). */
+	cache?: GithubCache;
+	/** Absolute managed-worktree root (config-resolved, §26). */
+	getWorktreeRoot?: () => string;
+	/** Shared-repository mutation lock (§31); a fresh lock by default. */
+	mutationLock?: RepositoryMutationLock;
 }
 
 export interface GithubTool {
@@ -234,10 +289,12 @@ Operations:
 - repo_view: repository metadata (description, URL, default branch, visibility, permission, language, stars, forks, archived/fork status, topics).
 - file_read: a file from a GitHub repository — text decoded, images returned as image content, other binaries as metadata with the GitHub source URL.
 - pr_create: create a pull request with an explicit title, or fill: true to generate title and body from the change via a nested agent session.
+- pr_checkout: check one PR (or a batch) out into dedicated managed worktrees — never touching the current checkout; the result's worktreePath is where edits happen via absolute paths.
+- pr_push: push a pr_checkout-prepared branch back to its PR; resolves by explicit pr/branch, the session's last checkout, or current-branch metadata.
 - search_issues / search_prs / search_code / search_commits / search_repos: GitHub searches — GitHub query syntax reaches the API unaltered; results render agent-useful fields with canonical URLs. Issues/PRs/code/commits scope to the current checkout unless the query already declares repo:/org:/user:/owner: scope.
-(Upcoming operations: pr_checkout, pr_push, run_watch.)
+(Upcoming operations: run_watch.)
 
-Use repo_view to orient in an unfamiliar repository, file_read instead of curl/wget for files stored in GitHub repositories, and the search_* operations instead of scraping pages.`;
+Use repo_view to orient in an unfamiliar repository, file_read instead of curl/wget for files stored in GitHub repositories, and the search_* operations instead of scraping pages. After pr_checkout, edit files under the returned worktree path using absolute paths.`;
 
 /** The dispatcher's own validation error for malformed tool parameters. */
 export class GithubParamsError extends PiOmpGitError {}
@@ -318,6 +375,50 @@ export function validateGithubArguments(params: unknown): GithubToolArguments {
 		}
 		validated[field] = value;
 	}
+	for (const field of ["force", "forceWithLease"] as const) {
+		const value = record[field];
+		if (value === undefined || value === null) continue;
+		if (typeof value !== "boolean") {
+			throw new GithubParamsError(
+				`The \`${field}\` parameter must be a boolean.`,
+			);
+		}
+		validated[field] = value;
+	}
+	// §24: `pr` values are text — a number as a string, a PR URL, or a
+	// branch-like identifier. JSON numbers are rejected outright.
+	const prValue = record.pr;
+	if (prValue !== undefined && prValue !== null) {
+		if (typeof prValue === "number") {
+			throw new GithubParamsError(
+				"The `pr` parameter must be text — a PR number as a string, a PR URL, or a branch-like identifier. JSON numbers are rejected.",
+			);
+		}
+		if (typeof prValue === "string") {
+			if (prValue.trim() === "") {
+				throw new GithubParamsError(
+					"The `pr` parameter must be a non-empty string.",
+				);
+			}
+			validated.pr = prValue;
+		} else if (Array.isArray(prValue)) {
+			if (prValue.length === 0) {
+				throw new GithubParamsError("The `pr` array must not be empty.");
+			}
+			if (
+				prValue.some((item) => typeof item !== "string" || item.trim() === "")
+			) {
+				throw new GithubParamsError(
+					"The `pr` array must contain non-empty strings.",
+				);
+			}
+			validated.pr = prValue as string[];
+		} else {
+			throw new GithubParamsError(
+				"The `pr` parameter must be a string or an array of strings.",
+			);
+		}
+	}
 	for (const field of ["reviewer", "assignee", "label"] as const) {
 		const value = record[field];
 		if (value === undefined || value === null) continue;
@@ -339,6 +440,18 @@ export function validateGithubArguments(params: unknown): GithubToolArguments {
 	) {
 		throw new GithubParamsError(
 			`The \`${operation}\` operation requires a non-empty \`query\` parameter.`,
+		);
+	}
+	// §24: pr_checkout requires `pr` (single or batch array).
+	if (operation === "pr_checkout" && validated.pr === undefined) {
+		throw new GithubParamsError(
+			"The `pr_checkout` operation requires the `pr` parameter — a PR number as a string, a PR URL, or a branch-like identifier.",
+		);
+	}
+	// §110: pr_push accepts a single PR; arrays are pr_checkout batching alone.
+	if (operation === "pr_push" && Array.isArray(validated.pr)) {
+		throw new GithubParamsError(
+			"pr_push accepts a single PR; the array form of `pr` is valid for pr_checkout batching only.",
 		);
 	}
 	return validated;
@@ -443,6 +556,77 @@ export async function executeGithubOperation(
 					repo: params.repo,
 					url: created.url,
 					number: created.number,
+				},
+			};
+		}
+
+		case "pr_checkout": {
+			await deps.availability.ensureGit();
+			const outcome = await checkoutPullRequests(
+				{
+					gh: deps.gh,
+					git: deps.git,
+					env: deps.env,
+					cwd: ctx?.cwd,
+					getWorktreeRoot:
+						deps.getWorktreeRoot ??
+						(() => join(homedir(), ".pi", "agent", "worktrees")),
+					mutationLock: deps.mutationLock ?? createMutationLock(),
+				},
+				{
+					pr: params.pr ?? "",
+					force: params.force,
+					repo: params.repo,
+				},
+				signal,
+			);
+			const single = outcome.checkouts[0];
+			return {
+				content: [{ type: "text", text: renderPrCheckout(outcome) }],
+				details: {
+					op: "pr_checkout",
+					repo: params.repo,
+					...(single
+						? {
+								number: single.number,
+								url: single.url,
+								prBranch: single.branch,
+								worktreePath: single.worktreePath,
+								reused: single.reused,
+							}
+						: {}),
+					checkouts: outcome.checkouts,
+					failures: outcome.failures,
+				},
+			};
+		}
+
+		case "pr_push": {
+			await deps.availability.ensureGit();
+			const pushed = await pushPullRequest(
+				{
+					gh: deps.gh,
+					git: deps.git,
+					cwd: ctx?.cwd,
+					cache: deps.cache,
+					getLastCheckout: ctx?.getLastCheckout,
+				},
+				{
+					pr: typeof params.pr === "string" ? params.pr : undefined,
+					branch: params.branch,
+					forceWithLease: params.forceWithLease,
+				},
+				signal,
+			);
+			return {
+				content: [{ type: "text", text: pushed.summary }],
+				details: {
+					op: "pr_push",
+					branch: pushed.branch,
+					url: pushed.url,
+					number: pushed.number,
+					resolvedBy: pushed.resolvedBy,
+					pushRemote: pushed.pushRemote,
 				},
 			};
 		}

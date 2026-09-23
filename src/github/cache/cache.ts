@@ -7,6 +7,12 @@
  * schedules a deduplicated background refresh; a row past the hard TTL
  * is evicted and fetched live. Disabled caching, no credential
  * fingerprint, or a degraded store all mean uncached operation.
+ *
+ * Invalidation (§33, §57–§58, tickets 13–14): rows drop after confirmed
+ * mutations — per-PR rows after a successful `pr_push`, per-resource
+ * rows for identified `gh` mutations, and whole-repository rows when a
+ * mutation is detected but its exact target cannot be established.
+ * Over-invalidation is preferred to staleness.
  */
 
 import type { CacheKey, CacheStore } from "./db.ts";
@@ -47,8 +53,24 @@ export interface GithubCache {
 		live: (signal?: AbortSignal) => Promise<string>,
 		signal?: AbortSignal,
 	): Promise<CacheReadOutcome>;
-	/** Drop the row for one identity (used by mutation invalidation later). */
+	/** Drop the row for one identity. */
 	invalidate(identity: CacheIdentity): void;
+	/** Drop all pr and pr-diff rows for one PR number (§33, §57). */
+	invalidatePrRows(target: {
+		host: string;
+		owner: string;
+		repo: string;
+		number: number;
+	}): void;
+	/** Drop all rows for one issue number (§57). */
+	invalidateIssueRows(target: {
+		host: string;
+		owner: string;
+		repo: string;
+		number: number;
+	}): void;
+	/** Drop every cached row for one repository (over-invalidation, §58). */
+	invalidateRepo(target: { host: string; owner: string; repo: string }): void;
 	/** Resolves once no background refresh is in flight (test seam). */
 	flushBackground(): Promise<void>;
 }
@@ -136,6 +158,13 @@ export function createGithubCache(deps: GithubCacheDeps): GithubCache {
 		};
 	}
 
+	function invalidateRow(identity: CacheIdentity): void {
+		const key = keyOf(identity);
+		const cache = handle();
+		if (!key || !cache) return;
+		safeRemove(cache, key);
+	}
+
 	function scheduleBackgroundRefresh(
 		key: CacheKey,
 		dedupKey: string,
@@ -158,6 +187,21 @@ export function createGithubCache(deps: GithubCacheDeps): GithubCache {
 				backgroundRefreshes.delete(dedupKey);
 			});
 		backgroundRefreshes.set(dedupKey, refresh);
+	}
+
+	/**
+	 * Drop every cached row for one resource identity across the given
+	 * kinds and both comment modes (the mode participates in identity).
+	 */
+	function invalidateRows(
+		target: { host: string; owner: string; repo: string; number: number },
+		kinds: Array<CacheIdentity["kind"]>,
+	): void {
+		for (const kind of kinds) {
+			for (const includeComments of [true, false]) {
+				invalidateRow({ ...target, kind, includeComments });
+			}
+		}
 	}
 
 	return {
@@ -219,11 +263,29 @@ export function createGithubCache(deps: GithubCacheDeps): GithubCache {
 			return { text, fromCache: false };
 		},
 
-		invalidate(identity) {
-			const key = keyOf(identity);
+		invalidate: invalidateRow,
+
+		invalidatePrRows(target) {
+			invalidateRows(target, ["pr", "pr-diff"]);
+		},
+
+		invalidateIssueRows(target) {
+			invalidateRows(target, ["issue"]);
+		},
+
+		invalidateRepo(target) {
+			const authKey = deps.authKey();
 			const cache = handle();
-			if (!key || !cache) return;
-			safeRemove(cache, key);
+			if (!authKey || !cache) return;
+			try {
+				cache.removeByRepo(
+					authKey,
+					target.host,
+					`${target.owner}/${target.repo}`,
+				);
+			} catch {
+				degrade();
+			}
 		},
 
 		async flushBackground() {

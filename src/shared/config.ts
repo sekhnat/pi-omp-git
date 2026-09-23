@@ -24,8 +24,14 @@ export interface GithubSettings {
 	cache: CacheSettings;
 }
 
+export interface WorktreeSettings {
+	/** Absolute managed-worktree root; resolved with env overrides. */
+	root?: string;
+}
+
 export interface OmpGitSettings {
 	github: GithubSettings;
+	worktree: WorktreeSettings;
 }
 
 export const CONFIG_DEFAULTS: OmpGitSettings = {
@@ -36,6 +42,10 @@ export const CONFIG_DEFAULTS: OmpGitSettings = {
 			softTtlSec: 300, // 5 minutes
 			hardTtlSec: 604_800, // 7 days
 		},
+	},
+	worktree: {
+		// §26 default managed-worktree root: <agentDir>/worktrees
+		root: undefined,
 	},
 };
 
@@ -54,6 +64,8 @@ export interface LoadConfigOptions {
 export interface ResolvedConfig extends OmpGitSettings {
 	/** Absolute path of the SQLite cache database after environment overrides. */
 	cacheDatabasePath: string;
+	/** Absolute managed-worktree root after environment overrides (§26). */
+	worktreeRoot: string;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -73,6 +85,27 @@ function readJsonFile(path: string): UnknownRecord {
 		// Missing or invalid configuration degrades to the next layer.
 		return {};
 	}
+}
+
+/** Pick a non-empty string, falling back when absent or mistyped. */
+function pickString(
+	layers: UnknownRecord[],
+	path: string[],
+): string | undefined {
+	for (const layer of layers) {
+		let current: unknown = layer;
+		for (const segment of path) {
+			if (current === null || typeof current !== "object") {
+				current = undefined;
+				break;
+			}
+			current = (current as UnknownRecord)[segment];
+		}
+		if (typeof current === "string" && current.trim() !== "") {
+			return current;
+		}
+	}
+	return undefined;
 }
 
 /** Pick a boolean, falling back when the value is absent or mistyped. */
@@ -134,6 +167,9 @@ export function loadConfig(options: LoadConfigOptions): ResolvedConfig {
 	}
 
 	const settings: OmpGitSettings = {
+		worktree: {
+			root: pickString(layers, ["worktree", "root"]),
+		},
 		github: {
 			enabled: pickBoolean(
 				layers,
@@ -172,6 +208,15 @@ export function loadConfig(options: LoadConfigOptions): ResolvedConfig {
 	const envPath =
 		options.env.PI_OMP_GITHUB_CACHE_DB ?? options.env.OMP_GITHUB_CACHE_DB;
 
+	// §26: the managed-worktree root comes from the configuration file,
+	// with PI_OMP_GIT_WORKTREE_DIR and the OMP migration alias overriding it.
+	const envWorktreeRoot =
+		options.env.PI_OMP_GIT_WORKTREE_DIR ?? options.env.OMP_WORKTREE_DIR;
+	const worktreeRoot =
+		envWorktreeRoot ??
+		settings.worktree.root ??
+		join(options.agentDir, "worktrees");
+
 	return {
 		...settings,
 		github: {
@@ -181,5 +226,6 @@ export function loadConfig(options: LoadConfigOptions): ResolvedConfig {
 		cacheDatabasePath:
 			envPath ??
 			join(options.agentDir, "cache", "pi-omp-git", "github-cache.db"),
+		worktreeRoot,
 	};
 }

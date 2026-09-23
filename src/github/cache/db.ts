@@ -34,6 +34,8 @@ export interface CacheStore {
 	get(key: CacheKey): CacheEntry | undefined;
 	set(key: CacheKey, entry: CacheEntry): void;
 	remove(key: CacheKey): void;
+	/** Drop every issue/pr/pr-diff row for one repository (§57–§58). */
+	removeByRepo(authKey: string, host: string, repo: string): void;
 }
 
 const DIR_MODE = 0o700;
@@ -149,6 +151,18 @@ export class SqliteCacheStore implements CacheStore {
 		}
 	}
 
+	removeByRepo(authKey: string, host: string, repo: string): void {
+		const db = this.handle();
+		if (!db) return;
+		try {
+			db.prepare(
+				"DELETE FROM github_cache WHERE auth_key = ? AND host = ? AND repo = ? AND kind IN ('issue', 'pr', 'pr-diff')",
+			).run(authKey, host, repo);
+		} catch {
+			this.degrade();
+		}
+	}
+
 	private degrade(): void {
 		this.degraded = true;
 		try {
@@ -191,4 +205,5 @@ export class NullCacheStore implements CacheStore {
 	}
 	set(): void {}
 	remove(): void {}
+	removeByRepo(): void {}
 }

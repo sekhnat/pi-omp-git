@@ -155,12 +155,8 @@ describe("github dispatcher validation", () => {
 
 	it("reports unimplemented operations clearly", async () => {
 		const { tool } = buildTool();
-		await expect(callGithub(tool, { op: "pr_checkout" })).rejects.toThrow(
-			/not available in this build/i,
-		);
-		await expect(callGithub(tool, { op: "pr_push" })).rejects.toThrow(
-			/not available in this build/i,
-		);
+		// pr_checkout/pr_push arrive with tickets 11 and 13; run_watch is
+		// the remaining unimplemented §18 surface.
 		await expect(callGithub(tool, { op: "run_watch" })).rejects.toThrow(
 			/not available in this build/i,
 		);
@@ -1229,7 +1225,7 @@ describe("executeGithubOperation", () => {
 			env: {},
 		};
 		await expect(
-			executeGithubOperation(deps, { op: "pr_push" }),
+			executeGithubOperation(deps, { op: "run_watch" }),
 		).rejects.toThrow(/not available in this build/i);
 	});
 });

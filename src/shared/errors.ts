@@ -62,6 +62,24 @@ export class InvalidJsonError extends PiOmpGitError {
 export class GithubApiError extends PiOmpGitError {}
 
 /** Map an availability probe failure into the thrown form GitHub surfaces use. */
+
+/** A local `pr-N` branch exists at a SHA other than the PR head (divergence D2). */
+export class PrCheckoutConflictError extends PiOmpGitError {}
+
+/** A branch carries no PR checkout metadata, so `pr_push` cannot act on it. */
+export class PrMetadataMissingError extends PiOmpGitError {}
+
+/** No worktree path could be allocated after the bounded suffix search. */
+export class WorktreeCollisionError extends PiOmpGitError {}
+
+/** A Git repository-level operation failed (resolution, worktree, refs). */
+export class GitRepositoryError extends PiOmpGitError {}
+
+/** A mutating Git operation (branch, push, reset) failed. */
+export class GitMutationError extends PiOmpGitError {}
+
+/** A Git hook rejected the operation; its stderr is preserved. */
+export class GitHookError extends PiOmpGitError {}
 export function ensureAvailable(
 	status:
 		| { ok: true }
