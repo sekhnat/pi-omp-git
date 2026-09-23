@@ -1,23 +1,23 @@
 /**
- * The `read` override — tickets 02 + 03 (docs/pi-omp-git-reference.md §7).
+ * The `read` override — tickets 02–05 (docs/pi-omp-git-reference.md §7).
  *
  * `issue://` and `pr://` scheme URIs route to the GitHub resource
  * machinery; everything else delegates to Pi's native read with zero
  * behavior change. The result shape (content blocks + ReadToolDetails)
  * matches the native read, so pagination discipline carries over.
- * (Listing and PR renderings land with tickets 04/05/07 — the parser
- * already validates their grammar, so those forms fail with a clear
- * not-implemented-yet error here rather than a malformed-URI error.)
+ * PR diff resources are implemented in ticket 05. Listing forms remain
+ * explicit not-implemented-yet errors until ticket 07.
  *
  * Since ticket 03, single-issue reads flow through the cache facade:
  * fresh rows are served without a second `gh` invocation, the soft/hard
  * TTL bands apply, and bare-form reads resolve the current repository
  * locally (never a network call) so cache rows can be scoped by repo.
- * The live `gh` call itself stays bare for bare-form reads — `gh`
- * performs its own repository resolution from the checkout (§ repo
- * resolution); the resolved identity only feeds the cache key.
+ * Issue fetches retain a bare command for checkout-resolved resources; PR
+ * and diff fetches pass explicit owner/repo, while the resolved identity
+ * scopes every cache row.
  */
 
+import { createHash } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type {
 	ReadToolDetails,
@@ -31,9 +31,17 @@ import { createGithubCache, type GithubCache } from "../cache/cache.ts";
 import { openCacheStore } from "../cache/db.ts";
 import { resolveCurrentGithubRepo } from "../repo.ts";
 import type { GhRunner } from "../runner.ts";
+import {
+	fetchPrDiff,
+	PR_DIFF_UPDATED_NOTICE,
+	parseCachedPrDiff,
+	parseUnifiedDiff,
+	renderPrDiff,
+} from "./diffs.ts";
 import { fetchIssue } from "./issues.ts";
 import { type GithubResource, parseGithubUri } from "./parser.ts";
 import { fetchPullRequest } from "./prs.ts";
+
 import { paginateRendered, renderIssue, renderPullRequest } from "./render.ts";
 
 export type NativeReadResult = AgentToolResult<ReadToolDetails | undefined>;
@@ -97,6 +105,7 @@ export async function readGithubResource(
 	resource: GithubResource,
 	request: { offset?: number; limit?: number },
 	signal?: AbortSignal,
+	versionState?: Map<string, string>,
 ): Promise<RenderedResource> {
 	switch (resource.kind) {
 		case "issue": {
@@ -167,10 +176,63 @@ export async function readGithubResource(
 				: outcome.text;
 			return paginateRendered(text, request.offset, request.limit);
 		}
-		case "pr-diff":
-			throw new PiOmpGitNotImplementedError(
-				"PR diff resources (pr://N/diff) are not implemented yet.",
-			);
+		case "pr-diff": {
+			await deps.availability.ensureGh();
+			const identity = await resolveResourceIdentity(deps, resource, signal);
+			const cacheIdentity = {
+				kind: "pr-diff" as const,
+				host: identity.host,
+				owner: identity.owner,
+				repo: identity.repo,
+				number: resource.number,
+				includeComments: false,
+			};
+			const target = {
+				...identity,
+				number: resource.number,
+				comments: false,
+			};
+			const live = async (): Promise<string> => {
+				const unifiedDiff = await fetchPrDiff(deps.gh, target, signal);
+				return JSON.stringify(parseUnifiedDiff(unifiedDiff));
+			};
+			let outcome = await deps.cache.readThrough(cacheIdentity, live, signal);
+			let diff: ReturnType<typeof parseCachedPrDiff>;
+			try {
+				diff = parseCachedPrDiff(outcome.text);
+			} catch {
+				// A malformed normalized row must not make the GitHub resource unusable.
+				deps.cache.invalidate(cacheIdentity);
+				outcome = await deps.cache.readThrough(cacheIdentity, live, signal);
+				diff = parseCachedPrDiff(outcome.text);
+			}
+			const versionKey = [
+				credentialFingerprint(deps.env) ?? "uncached",
+				identity.host,
+				identity.owner,
+				identity.repo,
+				resource.number,
+			].join("\u0000");
+			const version = createHash("sha256").update(outcome.text).digest("hex");
+			const previousVersion = versionState?.get(versionKey);
+			const changedDuringPagination =
+				(request.offset !== undefined || request.limit !== undefined) &&
+				previousVersion !== undefined &&
+				previousVersion !== version;
+			const rendered = renderPrDiff(diff, resource.number, resource.fileIndex);
+			const page = paginateRendered(rendered, request.offset, request.limit);
+			versionState?.set(versionKey, version);
+			const notices: string[] = [];
+			if (changedDuringPagination) notices.push(PR_DIFF_UPDATED_NOTICE);
+			if (outcome.staleNotice) notices.push(outcome.staleNotice);
+			return {
+				...page,
+				text:
+					notices.length > 0
+						? `${notices.join("\n")}\n\n${page.text}`
+						: page.text,
+			};
+		}
 		case "issue-list":
 			throw new PiOmpGitNotImplementedError(
 				"Issue listing (issue://) is not implemented yet.",
@@ -191,7 +253,7 @@ export async function readGithubResource(
  */
 async function resolveResourceIdentity(
 	deps: GithubReadDeps,
-	resource: GithubResource & { kind: "issue" | "pr" },
+	resource: GithubResource & { kind: "issue" | "pr" | "pr-diff" },
 	signal?: AbortSignal,
 ): Promise<{ host: string; owner: string; repo: string }> {
 	if (resource.owner && resource.repo) {
@@ -219,13 +281,20 @@ async function resolveResourceIdentity(
 export function createGithubReadOverride(
 	deps: GithubReadDeps,
 ): GithubReadOverride {
+	const versionState = new Map<string, string>();
 	return {
 		async execute(toolCallId, params, signal, onUpdate) {
 			if (!isGithubResourceUri(params.path)) {
 				return deps.nativeRead.execute(toolCallId, params, signal, onUpdate);
 			}
 			const resource = parseGithubUri(params.path);
-			const rendered = await readGithubResource(deps, resource, params, signal);
+			const rendered = await readGithubResource(
+				deps,
+				resource,
+				params,
+				signal,
+				versionState,
+			);
 			return {
 				content: [{ type: "text", text: rendered.text }],
 				details: { truncation: rendered.details.truncation },

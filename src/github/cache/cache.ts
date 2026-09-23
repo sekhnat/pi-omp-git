@@ -129,7 +129,7 @@ export function createGithubCache(deps: GithubCacheDeps): GithubCache {
 		return {
 			authKey,
 			host: identity.host,
-			repo: identity.repo,
+			repo: `${identity.owner}/${identity.repo}`,
 			kind: identity.kind,
 			number: identity.number,
 			includeComments: identity.includeComments,

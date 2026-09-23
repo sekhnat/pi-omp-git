@@ -23,6 +23,7 @@ export interface CacheEntry {
 export interface CacheKey {
 	authKey: string;
 	host: string;
+	/** Canonical owner/repo key (owner is part of cache identity). */
 	repo: string;
 	kind: "issue" | "pr" | "pr-diff";
 	number: number;
