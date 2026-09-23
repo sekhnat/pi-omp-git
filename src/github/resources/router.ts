@@ -1,12 +1,12 @@
 /**
- * The `read` override — tickets 02–06 (docs/pi-omp-git-reference.md §7).
+ * The `read` override — tickets 02–07 (docs/pi-omp-git-reference.md §7).
  *
  * `issue://` and `pr://` scheme URIs route to the GitHub resource
  * machinery; everything else delegates to Pi's native read with zero
  * behavior change. The result shape (content blocks + ReadToolDetails)
  * matches the native read, so pagination discipline carries over.
- * PR diff resources are implemented in tickets 05–06. Listing forms remain
- * explicit not-implemented-yet errors until ticket 07.
+ * PR diff resources are implemented in tickets 05–06; ticket 07 adds live,
+ * uncached issue and PR listing resources.
  *
  * Since ticket 03, single-issue reads flow through the cache facade:
  * fresh rows are served without a second `gh` invocation, the soft/hard
@@ -38,11 +38,17 @@ import {
 	renderPrDiff,
 } from "./diffs.ts";
 import { fetchIssue } from "./issues.ts";
+import { fetchIssueList, fetchPullRequestList } from "./lists.ts";
 import { type GithubResource, parseGithubUri } from "./parser.ts";
 import { fetchPullRequest } from "./prs.ts";
 
-import { paginateRendered, renderIssue, renderPullRequest } from "./render.ts";
-
+import {
+	paginateRendered,
+	renderIssue,
+	renderIssueList,
+	renderPullRequest,
+	renderPullRequestList,
+} from "./render.ts";
 export type NativeReadResult = AgentToolResult<ReadToolDetails | undefined>;
 
 export interface ReadToolParams {
@@ -89,13 +95,6 @@ export interface RenderedResource {
 
 export function isGithubResourceUri(path: string): boolean {
 	return /^(issue|pr):\/\//i.test(path);
-}
-
-export class PiOmpGitNotImplementedError extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = "PiOmpGitNotImplementedError";
-	}
 }
 
 /** Route + fetch + render + paginate one virtual GitHub resource. */
@@ -232,14 +231,46 @@ export async function readGithubResource(
 						: page.text,
 			};
 		}
-		case "issue-list":
-			throw new PiOmpGitNotImplementedError(
-				"Issue listing (issue://) is not implemented yet.",
+		case "issue-list": {
+			await deps.availability.ensureGh();
+			const identity = await resolveResourceIdentity(deps, resource, signal);
+			const issues = await fetchIssueList(
+				deps.gh,
+				{
+					...identity,
+					state: resource.state,
+					limit: resource.limit,
+					author: resource.author,
+					label: resource.label,
+				},
+				signal,
 			);
-		case "pr-list":
-			throw new PiOmpGitNotImplementedError(
-				"PR listing (pr://) is not implemented yet.",
+			return paginateRendered(
+				renderIssueList(issues, identity),
+				request.offset,
+				request.limit,
 			);
+		}
+		case "pr-list": {
+			await deps.availability.ensureGh();
+			const identity = await resolveResourceIdentity(deps, resource, signal);
+			const pulls = await fetchPullRequestList(
+				deps.gh,
+				{
+					...identity,
+					state: resource.state,
+					limit: resource.limit,
+					author: resource.author,
+					label: resource.label,
+				},
+				signal,
+			);
+			return paginateRendered(
+				renderPullRequestList(pulls, identity),
+				request.offset,
+				request.limit,
+			);
+		}
 	}
 }
 
@@ -252,7 +283,7 @@ export async function readGithubResource(
  */
 async function resolveResourceIdentity(
 	deps: GithubReadDeps,
-	resource: GithubResource & { kind: "issue" | "pr" | "pr-diff" },
+	resource: GithubResource,
 	signal?: AbortSignal,
 ): Promise<{ host: string; owner: string; repo: string }> {
 	if (resource.owner && resource.repo) {

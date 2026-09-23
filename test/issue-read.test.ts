@@ -1,13 +1,10 @@
 /**
- * Ticket 02 + 03 acceptance tests: `read issue://N` single-resource
- * rendering, repository/host scoping, comment suppression, delegation
- * with zero behavior change, native pagination discipline, dependency
- * gating, and the SQLite cache (ticket 03).
+ * Tickets 02, 03, and 07 acceptance tests: issue resource rendering, listing
+ * filters and live-fetch behavior, cache and repository/host scoping, native
+ * delegation, pagination discipline, and dependency gating.
  *
- * Only external behavior is asserted: a read call goes in, a tool
- * result comes out. GitHub I/O flows through the scripted `gh` fixture
- * seam from ticket 01, and the cache is a real SQLite database on a
- * temporary path (ticket 03 seam).
+ * External behavior only: GitHub I/O flows through the scripted `gh` fixture
+ * seam, and the cache is a real SQLite database on a temporary path.
  */
 
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -38,6 +35,7 @@ const ISSUE_FIELDS =
 	"number,title,state,stateReason,author,body,labels,createdAt,updatedAt,url,comments";
 const ISSUE_FIELDS_LEGACY =
 	"number,title,state,author,body,labels,createdAt,updatedAt,url,comments";
+const ISSUE_LIST_FIELDS = "number,title,state,author,labels,updatedAt,url";
 
 const ISSUE_PAYLOAD = {
 	number: 123,
@@ -540,11 +538,97 @@ describe("read override routing guardrails", () => {
 		expect(text).toContain("## Diff");
 	});
 
-	it("errors clearly on listing resources until ticket 07", async () => {
-		const { override } = buildDeps();
-		await expect(
-			readVirtual(override, { path: "issue://owner/repo" }),
-		).rejects.toThrow(/not implemented yet/);
+	it("lists bare issues with open/30 defaults and fetches every read live", async () => {
+		const args = [
+			"issue",
+			"list",
+			"--repo",
+			"owner/repo",
+			"--state",
+			"open",
+			"--limit",
+			"30",
+			"--json",
+			ISSUE_LIST_FIELDS,
+		];
+		const fixtureKey = ["gh", ...args].join(" ");
+		const payload = [
+			{
+				number: 42,
+				title: "Fix broken save",
+				state: "OPEN",
+				author: { login: "alice" },
+				labels: [{ name: "bug" }],
+				updatedAt: "2026-02-01T12:00:00Z",
+				url: "https://github.com/owner/repo/issues/42",
+			},
+		];
+		const { override, calls, fixtures } = buildDeps({
+			[fixtureKey]: { stdout: JSON.stringify(payload), exitCode: 0 },
+		});
+
+		const first = await readVirtual(override, { path: "issue://" });
+		fixtures[fixtureKey] = {
+			stdout: JSON.stringify([
+				{ ...payload[0], title: "Updated after first read" },
+			]),
+			exitCode: 0,
+		};
+		const second = await readVirtual(override, { path: "issue://" });
+		const text = first.content[0]?.type === "text" ? first.content[0].text : "";
+		const refreshedText =
+			second.content[0]?.type === "text" ? second.content[0].text : "";
+		expect(text).toContain("#42 [OPEN] Fix broken save");
+		expect(text).toContain("alice");
+		expect(text).toContain("bug");
+		expect(text).toContain("https://github.com/owner/repo/issues/42");
+		expect(refreshedText).toContain("#42 [OPEN] Updated after first read");
+		expect(refreshedText).not.toContain("Fix broken save");
+		expect(second.content[0]?.type).toBe("text");
+		expect(
+			calls.filter(
+				(call) =>
+					call.command === "gh" &&
+					call.args.slice(0, 2).join(" ") === "issue list",
+			),
+		).toHaveLength(2);
+	});
+
+	it("passes issue listing filters, clamps limits, and uses GH_HOST", async () => {
+		const args = [
+			"issue",
+			"list",
+			"--repo",
+			"owner/repo",
+			"--state",
+			"closed",
+			"--limit",
+			"100",
+			"--author",
+			"alice",
+			"--label",
+			"help wanted",
+			"--json",
+			ISSUE_LIST_FIELDS,
+		];
+		const fixtureKey = ["gh", ...args].join(" ");
+		const { override, calls } = buildDeps({
+			[fixtureKey]: { stdout: "[]", exitCode: 0 },
+		});
+		const result = await readVirtual(override, {
+			path: "issue://github.example.com/owner/repo?state=closed&limit=101&author=alice&label=help%20wanted",
+		});
+		const call = calls.find(
+			(candidate) =>
+				candidate.command === "gh" &&
+				candidate.args[0] === "issue" &&
+				candidate.args[1] === "list",
+		);
+		expect(call?.args).toEqual(args);
+		expect(call?.env.GH_HOST).toBe("github.example.com");
+		expect(
+			result.content[0]?.type === "text" ? result.content[0].text : "",
+		).toContain("No issues found.");
 	});
 
 	it("rejects invalid virtual URIs with clear errors instead of delegating", async () => {

@@ -1,6 +1,6 @@
 /**
  * Virtual GitHub URI grammar and validation
- * (docs/pi-omp-git-reference.md §8, §9).
+ * (docs/pi-omp-git-reference.md §8–§10).
  *
  * Grammar (single resources carry the read target; list forms browse):
  *
@@ -22,8 +22,31 @@
 
 import { PiOmpGitError } from "../../shared/errors.ts";
 
+type IssueListState = "open" | "closed" | "all";
+type PullListState = IssueListState | "merged";
+
+interface IssueListFilters {
+	state: IssueListState;
+	limit: number;
+	author?: string;
+	label?: string;
+}
+
+interface PullListFilters {
+	state: PullListState;
+	limit: number;
+	author?: string;
+	label?: string;
+}
+
+interface ListIdentity {
+	host?: string;
+	owner?: string;
+	repo?: string;
+}
+
 export type GithubResource =
-	| { kind: "issue-list"; host?: string; owner?: string; repo?: string }
+	| ({ kind: "issue-list" } & ListIdentity & IssueListFilters)
 	| {
 			kind: "issue";
 			host?: string;
@@ -32,7 +55,7 @@ export type GithubResource =
 			number: number;
 			comments: boolean;
 	  }
-	| { kind: "pr-list"; host?: string; owner?: string; repo?: string }
+	| ({ kind: "pr-list" } & ListIdentity & PullListFilters)
 	| {
 			kind: "pr";
 			host?: string;
@@ -49,7 +72,6 @@ export type GithubResource =
 			number: number;
 			fileIndex?: number | "all";
 	  };
-
 export class InvalidResourceUriError extends PiOmpGitError {
 	constructor(message: string) {
 		super(message);
@@ -63,6 +85,13 @@ function invalid(raw: string, reason: string): never {
 }
 
 const NUMERIC = /^[0-9]+$/;
+const DEFAULT_LIST_LIMIT = 30;
+const MAX_LIST_LIMIT = 100;
+const ISSUE_LIST_STATES: readonly IssueListState[] = ["open", "closed", "all"];
+const PULL_LIST_STATES: readonly PullListState[] = [
+	...ISSUE_LIST_STATES,
+	"merged",
+];
 
 function decodeSegment(
 	rawUri: string,
@@ -95,30 +124,136 @@ function decodeQueryValue(rawUri: string, part: string): string {
 	}
 }
 
-function parseQuery(rawUri: string, query: string): { comments: boolean } {
-	let comments = true;
-	for (const pair of query.split("&")) {
+function queryEntries(rawUri: string, query: string): Array<[string, string]> {
+	return query.split("&").map((pair) => {
 		const eq = pair.indexOf("=");
 		const rawKey = eq === -1 ? pair : pair.slice(0, eq);
 		const rawValue = eq === -1 ? "" : pair.slice(eq + 1);
-		const key = decodeQueryValue(rawUri, rawKey);
-		const value = decodeQueryValue(rawUri, rawValue);
-		if (key === "comments") {
-			if (value === "0" || value === "false") {
-				comments = false;
-			} else if (value === "1" || value === "true") {
-				comments = true;
-			} else {
-				invalid(
-					rawUri,
-					`invalid comments value "${value}" — expected 0, false, 1, or true`,
-				);
-			}
-			continue;
+		return [
+			decodeQueryValue(rawUri, rawKey),
+			decodeQueryValue(rawUri, rawValue),
+		];
+	});
+}
+
+function parseCommentsQuery(rawUri: string, query: string): boolean {
+	let comments = true;
+	for (const [key, value] of queryEntries(rawUri, query)) {
+		if (key !== "comments") {
+			invalid(rawUri, `unexpected query parameter "${key}"`);
 		}
-		invalid(rawUri, `unexpected query parameter "${key}"`);
+		if (value === "0" || value === "false") {
+			comments = false;
+		} else if (value === "1" || value === "true") {
+			comments = true;
+		} else {
+			invalid(
+				rawUri,
+				`invalid comments value "${value}" — expected 0, false, 1, or true`,
+			);
+		}
 	}
-	return { comments };
+	return comments;
+}
+
+function parseListFilters(
+	rawUri: string,
+	query: string | undefined,
+	scheme: "issue",
+): IssueListFilters;
+function parseListFilters(
+	rawUri: string,
+	query: string | undefined,
+	scheme: "pr",
+): PullListFilters;
+function parseListFilters(
+	rawUri: string,
+	query: string | undefined,
+	scheme: "issue" | "pr",
+): IssueListFilters | PullListFilters;
+function parseListFilters(
+	rawUri: string,
+	query: string | undefined,
+	scheme: "issue" | "pr",
+): IssueListFilters | PullListFilters {
+	let state = "open";
+	let limit = DEFAULT_LIST_LIMIT;
+	let author: string | undefined;
+	let label: string | undefined;
+	const states: readonly string[] =
+		scheme === "issue" ? ISSUE_LIST_STATES : PULL_LIST_STATES;
+	for (const [key, value] of query === undefined
+		? []
+		: queryEntries(rawUri, query)) {
+		switch (key) {
+			case "state":
+				if (!states.includes(value)) {
+					invalid(
+						rawUri,
+						`invalid ${scheme} listing state "${value}" — expected ${states.join(", ")}`,
+					);
+				}
+				state = value;
+				break;
+			case "limit": {
+				if (!NUMERIC.test(value)) {
+					invalid(
+						rawUri,
+						`invalid listing limit "${value}" — expected a positive integer`,
+					);
+				}
+				const parsed = Number(value);
+				if (!(parsed >= 1)) {
+					invalid(
+						rawUri,
+						`invalid listing limit "${value}" — expected a positive integer`,
+					);
+				}
+				limit = Math.min(parsed, MAX_LIST_LIMIT);
+				break;
+			}
+			case "author":
+				if (value === "") invalid(rawUri, `listing author must not be empty`);
+				author = value;
+				break;
+			case "label":
+				if (value === "") invalid(rawUri, `listing label must not be empty`);
+				label = value;
+				break;
+			default:
+				invalid(rawUri, `unexpected listing query parameter "${key}"`);
+		}
+	}
+
+	const filters = {
+		state,
+		limit,
+		...(author === undefined ? {} : { author }),
+		...(label === undefined ? {} : { label }),
+	};
+	return scheme === "issue"
+		? { ...filters, state: state as IssueListState }
+		: { ...filters, state: state as PullListState };
+}
+
+function parseListResource(
+	rawUri: string,
+	query: string | undefined,
+	scheme: "issue" | "pr",
+	identity: ListIdentity = {},
+): GithubResource {
+	if (scheme === "issue") {
+		return {
+			kind: "issue-list",
+			...identity,
+			...parseListFilters(rawUri, query, scheme),
+		};
+	}
+	return {
+		kind: "pr-list",
+		...identity,
+		...parseListFilters(rawUri, query, scheme),
+	};
 }
 
 function parsePositiveNumber(
@@ -189,23 +324,28 @@ export function parseGithubUri(rawUri: string): GithubResource {
 	);
 	const count = segments.length;
 
-	// Query parameters apply to single (numbered) resources only — listing
-	// parameters arrive with the listing ticket (§10), and ?comments=0 is
-	// defined for single-resource reads (§14).
+	// Query filters belong to list forms; ?comments=0 is only defined for
+	// single-resource reads (§14).
 	let comments = true;
 	if (queryPart !== undefined) {
+		const firstSegmentIsNumber = count > 0 && NUMERIC.test(segments[0] ?? "");
+		const listShape =
+			count === 0 ||
+			(!firstSegmentIsNumber &&
+				(count === 2 || (count === 3 && !NUMERIC.test(segments[2] ?? ""))));
 		const numbered = count > 0 && NUMERIC.test(segments[count - 1] ?? "");
-		if (!numbered) {
-			invalid(rawUri, `query parameters apply to single resources only`);
+		if (!listShape) {
+			if (!numbered) {
+				invalid(rawUri, `query parameters do not apply to this resource`);
+			}
+			comments = parseCommentsQuery(rawUri, queryPart);
 		}
-		({ comments } = parseQuery(rawUri, queryPart));
 	}
-
 	const seg = (index: number): string => segments[index] ?? "";
 	const firstIsNumber = count > 0 && NUMERIC.test(segments[0] ?? "");
 
 	if (count === 0) {
-		return { kind: `${scheme}-list` };
+		return parseListResource(rawUri, queryPart, scheme);
 	}
 
 	// A numeric first segment can only begin a bare-number resource.
@@ -254,7 +394,10 @@ export function parseGithubUri(rawUri: string): GithubResource {
 		};
 	}
 	if (count === 2) {
-		return { kind: `${scheme}-list`, owner: seg(0), repo: seg(1) };
+		return parseListResource(rawUri, queryPart, scheme, {
+			owner: seg(0),
+			repo: seg(1),
+		});
 	}
 
 	if (count === 3) {
@@ -270,12 +413,11 @@ export function parseGithubUri(rawUri: string): GithubResource {
 				? { kind: "issue", owner: seg(0), repo: seg(1), number, comments }
 				: { kind: "pr", owner: seg(0), repo: seg(1), number, comments };
 		}
-		return {
-			kind: `${scheme}-list`,
+		return parseListResource(rawUri, queryPart, scheme, {
 			host: seg(0),
 			owner: seg(1),
 			repo: seg(2),
-		};
+		});
 	}
 
 	if (count === 4) {

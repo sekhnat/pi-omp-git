@@ -1,14 +1,9 @@
 /**
- * Ticket 04 acceptance tests: `read pr://N` single-resource rendering —
- * the complete PR (metadata, body, files preview, reviews, line-level
- * review comments with thread relationships, conversation comments),
- * the 100-per-page review-comment collection, rendering when a PR has
- * review comments but zero conversation comments, `?comments=0|false`
- * suppression, minimized-comment exclusion, and the comments flag as
- * part of the cache identity (docs/pi-omp-git-reference.md §12–§14).
+ * Tickets 04 and 07 acceptance tests: PR rendering and discussion behavior,
+ * plus filtered live listings (docs/pi-omp-git-reference.md §§10, 12–14).
  *
- * External behavior only: GitHub I/O flows through the scripted `gh`
- * fixture seam; the cache is a real SQLite database on a temporary path.
+ * External behavior only: GitHub I/O flows through the scripted `gh` fixture
+ * seam; the cache is a real SQLite database on a temporary path.
  */
 
 import { mkdtempSync } from "node:fs";
@@ -34,6 +29,8 @@ import {
 import { createGhRunner, type GhFixtureMap } from "../src/github/runner.ts";
 import { loadConfig } from "../src/shared/config.ts";
 import { createRunner, type Exec } from "../src/shared/subprocess.ts";
+
+const PR_LIST_FIELDS = "number,title,state,isDraft,author,labels,updatedAt,url";
 
 const PR_PAYLOAD = {
 	number: 123,
@@ -154,6 +151,7 @@ function baseFixtures(): GhFixtureMap {
 interface CapturedCall {
 	command: string;
 	args: string[];
+	env: Record<string, string>;
 }
 
 interface BuildDepsOptions {
@@ -169,7 +167,7 @@ function buildDeps(
 	const fixtures = { ...baseFixtures(), ...fixtureOverrides };
 	const calls: CapturedCall[] = [];
 	const exec: Exec = async (spec) => {
-		calls.push({ command: spec.command, args: [...spec.args] });
+		calls.push({ command: spec.command, args: [...spec.args], env: spec.env });
 		const key = [spec.command, ...spec.args].join(" ");
 		const fixture = fixtures[key];
 		if (!fixture) {
@@ -465,5 +463,90 @@ describe("read pr://N error surfaces", () => {
 		await expect(readVirtual(override, { path: "pr://123" })).rejects.toThrow(
 			/pull request #123 was not found in owner\/repo/i,
 		);
+	});
+});
+
+describe("read pr:// listings (§10)", () => {
+	it("lists bare merged PRs with defaults and fetches every read live", async () => {
+		const args = [
+			"pr",
+			"list",
+			"--repo",
+			"owner/repo",
+			"--state",
+			"merged",
+			"--limit",
+			"30",
+			"--json",
+			PR_LIST_FIELDS,
+		];
+		const fixtureKey = ["gh", ...args].join(" ");
+		const payload = [
+			{
+				number: 77,
+				title: "Merged improvement",
+				state: "MERGED",
+				isDraft: false,
+				author: { login: "alice" },
+				labels: [{ name: "enhancement" }],
+				updatedAt: "2026-02-03T09:00:00Z",
+				url: "https://github.com/owner/repo/pull/77",
+			},
+		];
+		const { override, calls, fixtures } = buildDeps({
+			[fixtureKey]: { stdout: JSON.stringify(payload), exitCode: 0 },
+		});
+
+		const first = await readVirtual(override, { path: "pr://?state=merged" });
+		fixtures[fixtureKey] = {
+			stdout: JSON.stringify([{ ...payload[0], title: "Updated merged PR" }]),
+			exitCode: 0,
+		};
+		const second = await readVirtual(override, { path: "pr://?state=merged" });
+		expect(textOf(first)).toContain("#77 [MERGED] Merged improvement");
+		expect(textOf(second)).toContain("#77 [MERGED] Updated merged PR");
+		expect(textOf(second)).not.toContain("Merged improvement");
+		expect(
+			calls.filter(
+				(call) =>
+					call.command === "gh" &&
+					call.args[0] === "pr" &&
+					call.args[1] === "list",
+			),
+		).toHaveLength(2);
+	});
+
+	it("passes scoped PR list filters and preserves the Enterprise host", async () => {
+		const args = [
+			"pr",
+			"list",
+			"--repo",
+			"owner/repo",
+			"--state",
+			"closed",
+			"--limit",
+			"12",
+			"--author",
+			"bob",
+			"--label",
+			"enhancement",
+			"--json",
+			PR_LIST_FIELDS,
+		];
+		const fixtureKey = ["gh", ...args].join(" ");
+		const { override, calls } = buildDeps({
+			[fixtureKey]: { stdout: "[]", exitCode: 0 },
+		});
+		await readVirtual(override, {
+			path: "pr://github.example.com/owner/repo?state=closed&limit=12&author=bob&label=enhancement",
+		});
+		const call = calls.find(
+			(candidate) =>
+				candidate.command === "gh" &&
+				candidate.args[0] === "pr" &&
+				candidate.args[1] === "list",
+		);
+		expect(call?.args).toEqual(args);
+		expect(call?.env.GH_HOST).toBe("github.example.com");
 	});
 });

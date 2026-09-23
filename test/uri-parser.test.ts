@@ -35,16 +35,24 @@ describe("issue:// grammar", () => {
 			kind: "issue-list",
 			owner: "owner",
 			repo: "repo",
+			state: "open",
+			limit: 30,
 		});
 	});
 
 	it("parses bare and host-qualified listing forms", () => {
-		expect(parseGithubUri("issue://")).toEqual({ kind: "issue-list" });
+		expect(parseGithubUri("issue://")).toEqual({
+			kind: "issue-list",
+			state: "open",
+			limit: 30,
+		});
 		expect(parseGithubUri("issue://github.example.com/owner/repo")).toEqual({
 			kind: "issue-list",
 			host: "github.example.com",
 			owner: "owner",
 			repo: "repo",
+			state: "open",
+			limit: 30,
 		});
 	});
 
@@ -72,6 +80,71 @@ describe("issue:// grammar", () => {
 			"issue://123?state=open",
 			"issue://123?bogus",
 			"issue://123?",
+		]) {
+			expect(() => parseGithubUri(bad)).toThrow(/Invalid GitHub resource URI/);
+		}
+	});
+});
+
+describe("listing query parameters (§10)", () => {
+	it("parses filters, defaults, merged PRs, and clamps limits", () => {
+		expect(parseGithubUri("issue://")).toEqual({
+			kind: "issue-list",
+			state: "open",
+			limit: 30,
+		});
+		expect(parseGithubUri("issue://owner/repo")).toEqual({
+			kind: "issue-list",
+			owner: "owner",
+			repo: "repo",
+			state: "open",
+			limit: 30,
+		});
+		expect(
+			parseGithubUri(
+				"issue://owner/repo?state=closed&limit=25&author=alice&label=help%20wanted",
+			),
+		).toEqual({
+			kind: "issue-list",
+			owner: "owner",
+			repo: "repo",
+			state: "closed",
+			limit: 25,
+			author: "alice",
+			label: "help wanted",
+		});
+		expect(
+			parseGithubUri(
+				"pr://?state=merged&limit=999999999999999999999999999999&author=alice&label=bug",
+			),
+		).toEqual({
+			kind: "pr-list",
+			state: "merged",
+			limit: 100,
+			author: "alice",
+			label: "bug",
+		});
+		expect(
+			parseGithubUri("pr://github.example.com/owner/repo?state=all"),
+		).toEqual({
+			kind: "pr-list",
+			host: "github.example.com",
+			owner: "owner",
+			repo: "repo",
+			state: "all",
+			limit: 30,
+		});
+	});
+
+	it("rejects invalid listing states, limits, and empty filters", () => {
+		for (const bad of [
+			"issue://?state=merged",
+			"pr://?state=unknown",
+			"pr://?limit=0",
+			"pr://?limit=1.5",
+			"issue://?author=",
+			"issue://?comments=0",
+			"pr://123?state=open",
 		]) {
 			expect(() => parseGithubUri(bad)).toThrow(/Invalid GitHub resource URI/);
 		}

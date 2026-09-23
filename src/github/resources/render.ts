@@ -1,9 +1,8 @@
 /**
- * Deterministic Markdown rendering of single GitHub resources (§11) and
- * the native-read pagination discipline applied to rendered snapshots
- * (§7): offset/limit semantics, the 2000-line / 50KB caps, and the
- * standard continuation notices — byte-identical to Pi's native read
- * text path (built from Pi's own truncateHead/formatSize helpers).
+ * Deterministic Markdown rendering of GitHub resources and the native-read
+ * pagination discipline applied to rendered snapshots (§7, §10–§14):
+ * offset/limit semantics, the 2000-line / 50KB caps, and standard notices
+ * built from Pi's own truncateHead/formatSize helpers.
  */
 
 import {
@@ -14,6 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { PiOmpGitError } from "../../shared/errors.ts";
 import type { GhIssue } from "./issues.ts";
+import type { GhIssueListItem, GhPullListItem } from "./lists.ts";
 import type { GhPull, GhReviewComment } from "./prs.ts";
 /** Files preview cap (§12): 50, matching OMP's current preview limit. */
 export const FILES_PREVIEW_CAP = 50;
@@ -54,6 +54,75 @@ export function renderIssue(
 		}
 	}
 	return lines.join("\n");
+}
+
+export function renderIssueList(
+	issues: GhIssueListItem[],
+	repository: { owner: string; repo: string },
+): string {
+	return renderListing(
+		`Issues in ${repository.owner}/${repository.repo}`,
+		"No issues found.",
+		issues.map((issue) => ({
+			summary: `#${issue.number} [${singleLine(issue.state)}] ${singleLine(issue.title)}`,
+			metadata: [
+				issue.author ? `@${singleLine(issue.author)}` : undefined,
+				issue.labels.length > 0
+					? `labels: ${issue.labels.map(singleLine).join(", ")}`
+					: undefined,
+				issue.updatedAt ? `updated: ${singleLine(issue.updatedAt)}` : undefined,
+			].filter((item): item is string => item !== undefined),
+			url: issue.url,
+		})),
+	);
+}
+
+export function renderPullRequestList(
+	pulls: GhPullListItem[],
+	repository: { owner: string; repo: string },
+): string {
+	return renderListing(
+		`Pull requests in ${repository.owner}/${repository.repo}`,
+		"No pull requests found.",
+		pulls.map((pull) => ({
+			summary: `#${pull.number} [${singleLine(pull.state)}] ${singleLine(pull.title)}`,
+			metadata: [
+				pull.isDraft ? "draft" : undefined,
+				pull.author ? `@${singleLine(pull.author)}` : undefined,
+				pull.labels.length > 0
+					? `labels: ${pull.labels.map(singleLine).join(", ")}`
+					: undefined,
+				pull.updatedAt ? `updated: ${singleLine(pull.updatedAt)}` : undefined,
+			].filter((item): item is string => item !== undefined),
+			url: pull.url,
+		})),
+	);
+}
+
+interface ListingEntry {
+	summary: string;
+	metadata: string[];
+	url?: string;
+}
+
+function renderListing(
+	heading: string,
+	emptyMessage: string,
+	entries: ListingEntry[],
+): string {
+	const lines = [`# ${heading}`];
+	if (entries.length === 0) return `${lines.join("\n")}\n\n${emptyMessage}`;
+	for (const entry of entries) {
+		const metadata =
+			entry.metadata.length > 0 ? ` — ${entry.metadata.join(" · ")}` : "";
+		lines.push("", `- ${entry.summary}${metadata}`);
+		if (entry.url) lines.push(`  URL: ${entry.url}`);
+	}
+	return lines.join("\n");
+}
+
+function singleLine(value: string): string {
+	return value.replace(/\s+/g, " ").trim();
 }
 
 /**
