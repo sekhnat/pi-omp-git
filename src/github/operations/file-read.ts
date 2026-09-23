@@ -171,7 +171,7 @@ export function looksBinary(text: string): boolean {
 	return text.slice(0, SNIFF_WINDOW).includes("\u0000");
 }
 
-function sanitizeStderr(result: RunResult): string {
+export function sanitizeStderr(result: RunResult): string {
 	const line = result.stderr
 		.split("\n")
 		.map((candidate) => candidate.trim())
