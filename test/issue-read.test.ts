@@ -1,28 +1,33 @@
 /**
- * Ticket 02 acceptance tests: `read issue://N` single-resource rendering,
- * repository/host scoping, comment suppression, delegation with zero
- * behavior change, native pagination discipline, and dependency gating.
+ * Ticket 02 + 03 acceptance tests: `read issue://N` single-resource
+ * rendering, repository/host scoping, comment suppression, delegation
+ * with zero behavior change, native pagination discipline, dependency
+ * gating, and the SQLite cache (ticket 03).
  *
- * Only external behavior is asserted: a read call goes in, a tool result
- * comes out. GitHub I/O flows through the scripted `gh` fixture seam
- * from ticket 01.
+ * Only external behavior is asserted: a read call goes in, a tool
+ * result comes out. GitHub I/O flows through the scripted `gh` fixture
+ * seam from ticket 01, and the cache is a real SQLite database on a
+ * temporary path (ticket 03 seam).
  */
 
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createReadTool } from "@earendil-works/pi-coding-agent";
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
+import { createGitRunner } from "../src/git/runner.ts";
 import { createAvailability } from "../src/github/availability.ts";
+import { credentialFingerprint } from "../src/github/cache/auth-key.ts";
+import { createGithubCache } from "../src/github/cache/cache.ts";
+import { openCacheStore } from "../src/github/cache/db.ts";
 import {
 	createGithubReadOverride,
+	type GithubReadOverride,
 	isGithubResourceUri,
 	type ReadToolParams,
 } from "../src/github/resources/router.ts";
-import {
-	createGhRunner,
-	type GhFixtureMap,
-} from "../src/github/runner.ts";
+import { createGhRunner, type GhFixtureMap } from "../src/github/runner.ts";
+import { loadConfig } from "../src/shared/config.ts";
 import {
 	CommandNotFoundError,
 	createRunner,
@@ -74,6 +79,10 @@ function baseFixtures(): GhFixtureMap {
 			stdout: issuePayloadJson(),
 			exitCode: 0,
 		},
+		"git remote get-url origin": {
+			stdout: "https://github.com/owner/repo\n",
+			exitCode: 0,
+		},
 		"gh --version": { stdout: "gh version 2.40.0\n", exitCode: 0 },
 		"gh auth status": { exitCode: 0 },
 	};
@@ -85,7 +94,18 @@ interface CapturedCall {
 	env: Record<string, string>;
 }
 
-function buildDeps(fixtureOverrides: GhFixtureMap = {}) {
+interface BuildDepsOptions {
+	cacheEnabled?: boolean;
+	softTtlSec?: number;
+	hardTtlSec?: number;
+	now?: () => number;
+	authToken?: string;
+}
+
+function buildDeps(
+	fixtureOverrides: GhFixtureMap = {},
+	options: BuildDepsOptions = {},
+) {
 	const fixtures = { ...baseFixtures(), ...fixtureOverrides };
 	const calls: CapturedCall[] = [];
 	const exec: Exec = async (spec) => {
@@ -113,22 +133,60 @@ function buildDeps(fixtureOverrides: GhFixtureMap = {}) {
 			);
 		},
 	};
+	const cacheDir = mkdtempSync(join(tmpdir(), "pi-omp-git-cache-"));
+	const dbPath = join(cacheDir, "github-cache.db");
+	const env: Record<string, string> = {
+		PI_OMP_GITHUB_CACHE_DB: dbPath,
+		GH_TOKEN: options.authToken ?? "cache-test-token",
+		GH_CONFIG_DIR: join(cacheDir, "gh-config"),
+	};
+	const cacheSettings = {
+		enabled: options.cacheEnabled ?? true,
+		softTtlSec: options.softTtlSec ?? 300,
+		hardTtlSec: options.hardTtlSec ?? 604800,
+	};
+	const cache = createGithubCache({
+		getStore: () => openCacheStore(dbPath),
+		getSettings: () => cacheSettings,
+		authKey: () => credentialFingerprint(env),
+		now: options.now,
+	});
 	const override = createGithubReadOverride({
 		gh: createGhRunner({ exec }),
+		git: createGitRunner({ exec }),
 		availability,
+		cache,
+		env,
+		getConfig: () =>
+			loadConfig({
+				agentDir: cacheDir,
+				cwd: cacheDir,
+				env,
+				projectTrusted: false,
+			}),
 		nativeRead,
 	});
-	return { override, availability, calls, nativeRead };
+	return {
+		override,
+		availability,
+		calls,
+		fixtures,
+		nativeRead,
+		env,
+		setAuthToken: (token: string): void => {
+			env.GH_TOKEN = token;
+		},
+	};
 }
 
-const readVirtual = (
-	override: ReturnType<typeof createGithubReadOverride>,
-	params: ReadToolParams,
-) => override.execute("test-call-id", params, undefined, undefined);
+const readVirtual = (override: GithubReadOverride, params: ReadToolParams) =>
+	override.execute("test-call-id", params, undefined, undefined);
 
-beforeEach(() => {
-	// availability probes memoize per instance; instances are per-test.
-});
+const ghViewCallCount = (calls: CapturedCall[]): number =>
+	calls.filter(
+		(candidate) =>
+			candidate.command === "gh" && candidate.args.includes("view"),
+	).length;
 
 describe("read issue://N rendering", () => {
 	it("renders the complete issue with all sections", async () => {
@@ -196,12 +254,7 @@ describe("read issue://N repository resolution", () => {
 	});
 
 	it("targets host-qualified resources via GH_HOST without clobbering auth", async () => {
-		const { override, calls } = buildDeps({
-			[`gh issue view 123 -R owner/repo --json ${ISSUE_FIELDS}`]: {
-				stdout: issuePayloadJson(),
-				exitCode: 0,
-			},
-		});
+		const { override, calls } = buildDeps();
 		await readVirtual(override, {
 			path: "issue://github.example.com/owner/repo/123",
 		});
@@ -239,9 +292,34 @@ describe("read override delegation (zero behavior change)", () => {
 		const runner = createRunner({ exec });
 		const availability = createAvailability(runner);
 		const nativeRead = createReadTool(dir);
+		const cacheDir = mkdtempSync(join(tmpdir(), "pi-omp-git-cache-"));
+		const dbPath = join(cacheDir, "github-cache.db");
+		const env: Record<string, string> = {
+			PI_OMP_GITHUB_CACHE_DB: dbPath,
+			GH_CONFIG_DIR: join(cacheDir, "gh-config"),
+		};
+		const cache = createGithubCache({
+			getStore: () => openCacheStore(dbPath),
+			getSettings: () => ({
+				enabled: false,
+				softTtlSec: 300,
+				hardTtlSec: 604800,
+			}),
+			authKey: () => credentialFingerprint(env),
+		});
 		const override = createGithubReadOverride({
 			gh: createGhRunner({ exec }),
+			git: createGitRunner({ exec }),
 			availability,
+			cache,
+			env,
+			getConfig: () =>
+				loadConfig({
+					agentDir: cacheDir,
+					cwd: cacheDir,
+					env,
+					projectTrusted: false,
+				}),
 			nativeRead,
 		});
 
@@ -345,7 +423,25 @@ describe("read override dependency gating (§4, §49)", () => {
 		const runner = createRunner({ exec });
 		const override = createGithubReadOverride({
 			gh: createGhRunner({ exec }),
+			git: createGitRunner({ exec }),
 			availability: createAvailability(runner),
+			cache: createGithubCache({
+				getStore: () => openCacheStore(join(tmpdir(), "dep-cache.db")),
+				getSettings: () => ({
+					enabled: true,
+					softTtlSec: 300,
+					hardTtlSec: 604800,
+				}),
+				authKey: () => credentialFingerprint({ GH_TOKEN: "dep-token" }),
+			}),
+			env: {},
+			getConfig: () =>
+				loadConfig({
+					agentDir: join(tmpdir(), "dep-agent"),
+					cwd: join(tmpdir(), "dep-cwd"),
+					env: {},
+					projectTrusted: false,
+				}),
 			nativeRead: {
 				execute: async () => {
 					throw new Error("unreachable");
@@ -391,13 +487,7 @@ describe("read override dependency gating (§4, §49)", () => {
 	});
 
 	it("keeps git reads flowing through the same runner when gh is missing", async () => {
-		const calls: CapturedCall[] = [];
 		const exec: Exec = async (spec) => {
-			calls.push({
-				command: spec.command,
-				args: [...spec.args],
-				env: spec.env,
-			});
 			if (spec.command === "git") {
 				return {
 					exitCode: 0,
@@ -446,5 +536,88 @@ describe("read override routing guardrails", () => {
 		await expect(
 			readVirtual(override, { path: "issue://123/foo" }),
 		).rejects.toThrow(/Invalid GitHub resource URI/);
+	});
+});
+
+describe("read issue://N caching (ticket 03)", () => {
+	it("serves a fresh row without a second gh invocation", async () => {
+		const { override, calls } = buildDeps();
+		const first = await readVirtual(override, { path: "issue://123" });
+		expect(ghViewCallCount(calls)).toBe(1);
+		const second = await readVirtual(override, { path: "issue://123" });
+		expect(ghViewCallCount(calls)).toBe(1);
+		const firstText =
+			first.content[0]?.type === "text" ? first.content[0].text : "";
+		const secondText =
+			second.content[0]?.type === "text" ? second.content[0].text : "";
+		expect(secondText).toBe(firstText);
+	});
+
+	it("refreshes soft-expired rows synchronously", async () => {
+		let nowMs = 1_000_000;
+		const { override, calls } = buildDeps(
+			{},
+			{ softTtlSec: 1, now: () => nowMs },
+		);
+		await readVirtual(override, { path: "issue://123" });
+		expect(ghViewCallCount(calls)).toBe(1);
+		nowMs += 2_000;
+		await readVirtual(override, { path: "issue://123" });
+		expect(ghViewCallCount(calls)).toBe(2);
+	});
+
+	it("serves stale rows with a visible warning when a refresh fails", async () => {
+		let nowMs = 1_000_000;
+		const { override, fixtures } = buildDeps(
+			{},
+			{ softTtlSec: 1, now: () => nowMs },
+		);
+		await readVirtual(override, { path: "issue://123" });
+		fixtures[`gh issue view 123 --json ${ISSUE_FIELDS}`] = {
+			stdout: "",
+			exitCode: 1,
+			stderr: "boom",
+		};
+		nowMs += 2_000;
+		const result = await readVirtual(override, { path: "issue://123" });
+		const text =
+			result.content[0]?.type === "text" ? result.content[0].text : "";
+		expect(text).toContain("GitHub cache: refresh failed");
+		expect(text).toContain("# 123 Bug: crash on save");
+	});
+
+	it("evicts hard-expired rows and refetches", async () => {
+		let nowMs = 1_000_000;
+		const fresh = issuePayloadJson({ title: "Fresh after eviction" });
+		const { override, calls } = buildDeps(
+			{
+				[`gh issue view 123 --json ${ISSUE_FIELDS}`]: {
+					stdout: fresh,
+					exitCode: 0,
+				},
+			},
+			{ softTtlSec: 1, hardTtlSec: 2, now: () => nowMs },
+		);
+		await readVirtual(override, { path: "issue://123" });
+		nowMs += 3_000;
+		const result = await readVirtual(override, { path: "issue://123" });
+		const text =
+			result.content[0]?.type === "text" ? result.content[0].text : "";
+		expect(text).toContain("Fresh after eviction");
+		expect(ghViewCallCount(calls)).toBe(2);
+	});
+
+	it("isolates rows by credential fingerprint", async () => {
+		const { override, setAuthToken } = buildDeps();
+		await readVirtual(override, { path: "issue://123" });
+		setAuthToken("different-identity-token");
+		await readVirtual(override, { path: "issue://123" });
+	});
+
+	it("isolates rows by comments mode", async () => {
+		const { override, calls } = buildDeps();
+		await readVirtual(override, { path: "issue://123" });
+		await readVirtual(override, { path: "issue://123?comments=0" });
+		expect(ghViewCallCount(calls)).toBe(2);
 	});
 });
