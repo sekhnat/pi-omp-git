@@ -511,11 +511,33 @@ describe("read override dependency gating (§4, §49)", () => {
 });
 
 describe("read override routing guardrails", () => {
-	it("errors clearly on PR resources until ticket 04", async () => {
-		const { override } = buildDeps();
-		await expect(readVirtual(override, { path: "pr://123" })).rejects.toThrow(
-			/not implemented yet/,
-		);
+	it("renders PR resources as of ticket 04 (routing guardrail)", async () => {
+		const { override } = buildDeps({
+			"gh pr view 123 -R owner/repo --json number,title,state,isDraft,author,baseRefName,headRefName,reviewDecision,mergeStateStatus,body,labels,createdAt,updatedAt,url,files,reviews,comments":
+				{
+					stdout: JSON.stringify({
+						number: 123,
+						title: "t",
+						state: "OPEN",
+						isDraft: false,
+						labels: [],
+						files: [],
+						reviews: [],
+						comments: [],
+					}),
+					exitCode: 0,
+				},
+			"gh api repos/owner/repo/pulls/123/comments?per_page=100 --paginate --slurp":
+				{
+					stdout: "[]",
+					exitCode: 0,
+				},
+		});
+		const result = await readVirtual(override, { path: "pr://123" });
+		const text =
+			result.content[0]?.type === "text" ? result.content[0].text : "";
+		expect(text).toContain("# 123 t");
+		expect(text).toContain("## Diff");
 	});
 
 	it("errors clearly on listing resources until ticket 07", async () => {

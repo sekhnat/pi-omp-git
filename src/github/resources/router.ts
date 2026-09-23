@@ -33,7 +33,8 @@ import { resolveCurrentGithubRepo } from "../repo.ts";
 import type { GhRunner } from "../runner.ts";
 import { fetchIssue } from "./issues.ts";
 import { type GithubResource, parseGithubUri } from "./parser.ts";
-import { paginateRendered, renderIssue } from "./render.ts";
+import { fetchPullRequest } from "./prs.ts";
+import { paginateRendered, renderIssue, renderPullRequest } from "./render.ts";
 
 export type NativeReadResult = AgentToolResult<ReadToolDetails | undefined>;
 
@@ -100,7 +101,7 @@ export async function readGithubResource(
 	switch (resource.kind) {
 		case "issue": {
 			await deps.availability.ensureGh();
-			const identity = await resolveIssueIdentity(deps, resource, signal);
+			const identity = await resolveResourceIdentity(deps, resource, signal);
 			const live = async (): Promise<string> => {
 				const issue = await fetchIssue(
 					deps.gh,
@@ -132,10 +133,40 @@ export async function readGithubResource(
 				: outcome.text;
 			return paginateRendered(text, request.offset, request.limit);
 		}
-		case "pr":
-			throw new PiOmpGitNotImplementedError(
-				"PR resources (pr://N) are not implemented yet.",
+		case "pr": {
+			await deps.availability.ensureGh();
+			const identity = await resolveResourceIdentity(deps, resource, signal);
+			const live = async (): Promise<string> => {
+				const pull = await fetchPullRequest(
+					deps.gh,
+					{
+						host: resource.host,
+						owner: identity.owner,
+						repo: identity.repo,
+						number: resource.number,
+						comments: resource.comments,
+					},
+					signal,
+				);
+				return renderPullRequest(pull, { comments: resource.comments });
+			};
+			const outcome = await deps.cache.readThrough(
+				{
+					kind: "pr",
+					host: identity.host,
+					owner: identity.owner,
+					repo: identity.repo,
+					number: resource.number,
+					includeComments: resource.comments,
+				},
+				live,
+				signal,
 			);
+			const text = outcome.staleNotice
+				? `${outcome.staleNotice}\n${outcome.text}`
+				: outcome.text;
+			return paginateRendered(text, request.offset, request.limit);
+		}
 		case "pr-diff":
 			throw new PiOmpGitNotImplementedError(
 				"PR diff resources (pr://N/diff) are not implemented yet.",
@@ -158,9 +189,9 @@ export async function readGithubResource(
  * network call) and throws the friendly repository-context error when
  * the checkout yields no GitHub remote (§49).
  */
-async function resolveIssueIdentity(
+async function resolveResourceIdentity(
 	deps: GithubReadDeps,
-	resource: GithubResource & { kind: "issue" },
+	resource: GithubResource & { kind: "issue" | "pr" },
 	signal?: AbortSignal,
 ): Promise<{ host: string; owner: string; repo: string }> {
 	if (resource.owner && resource.repo) {
