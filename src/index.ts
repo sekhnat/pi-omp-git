@@ -1,31 +1,63 @@
 /**
- * pi-omp-git extension entry — ticket 01 lands the loadable package
- * skeleton. Nothing model-facing registers yet (the `read` override lands
- * in ticket 02, the `github` dispatcher in ticket 08). No processes are
- * started at load; availability probes run lazily.
+ * everything else delegates to Pi's native read with zero behavior
+ * change. Delegation follows Pi's built-in-tool-renderer pattern: the
+ * native read instance is created with the load cwd and receives
+ * four-argument execute calls.
+ * Nothing else registers model-facing surface yet (the `github` tool
+ * arrives in ticket 08). No processes start at load; availability
+ * probes run lazily.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createReadTool } from "@earendil-works/pi-coding-agent";
 import {
 	type Availability,
 	createAvailability,
 } from "./github/availability.ts";
+import {
+	createGithubReadOverride,
+	type GithubReadOverride,
+} from "./github/resources/router.ts";
+import { createGhRunner, type GhRunner } from "./github/runner.ts";
 import type { Runner } from "./shared/subprocess.ts";
 import { createRunner } from "./shared/subprocess.ts";
 
 /** Session-scoped wiring later tickets build on. */
 export interface OmpGitContext {
 	runner: Runner;
+	gh: GhRunner;
 	availability: Availability;
+	nativeRead: ReturnType<typeof createReadTool>;
+	readOverride: GithubReadOverride;
 }
 
-export function createOmpGitContext(): OmpGitContext {
+export function createOmpGitContext(cwd?: string): OmpGitContext {
 	const runner = createRunner();
-	return { runner, availability: createAvailability(runner) };
+	const gh = createGhRunner({ exec: undefined, cwd });
+	const availability = createAvailability(runner);
+	const nativeRead = createReadTool(cwd ?? process.cwd());
+	const readOverride = createGithubReadOverride({
+		gh,
+		availability,
+		nativeRead,
+	});
+	return { runner, gh, availability, nativeRead, readOverride };
 }
 
 export default function piOmpGitExtension(pi: ExtensionAPI): void {
 	const ctx = createOmpGitContext();
+
+	// `read` override (ticket 02): virtual GitHub URIs render; every other
+	// path delegates to Pi's native read with zero behavior change.
+	pi.registerTool({
+		name: "read",
+		label: "read",
+		description: ctx.nativeRead.description,
+		parameters: ctx.nativeRead.parameters,
+		async execute(toolCallId, params, signal, onUpdate) {
+			return ctx.readOverride.execute(toolCallId, params, signal, onUpdate);
+		},
+	});
 
 	pi.registerCommand("omp-git-doctor", {
 		description: "Report git and gh availability for pi-omp-git",

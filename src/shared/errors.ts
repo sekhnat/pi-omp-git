@@ -44,6 +44,16 @@ export class NoRepositoryContextError extends PiOmpGitError {
 	}
 }
 
+/** A resolved resource (issue, PR, file) does not exist on the host. */
+export class ResourceNotFoundError extends PiOmpGitError {}
+
+/** `gh` produced output that is not parseable JSON. */
+export class InvalidJsonError extends PiOmpGitError {
+	constructor(message: string = FRIENDLY_ERRORS.invalidJson) {
+		super(message);
+	}
+}
+
 /** Map an availability probe failure into the thrown form GitHub surfaces use. */
 export function ensureAvailable(
 	status:
