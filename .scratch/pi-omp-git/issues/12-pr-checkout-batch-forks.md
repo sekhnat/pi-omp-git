@@ -4,7 +4,7 @@
 
 **Blocked by:** 11 (`pr_checkout` single PR with managed worktree and mutation lock).
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 - [x] Array checkout: every PR is attempted; successes are never rolled back due to other failures
 - [x] ≥1 success → successful result with `checkouts[]` + `failures[]`; 0 successes → tool error with the same structured body

@@ -4,7 +4,7 @@
 
 **Blocked by:** 08 (`github` dispatcher with `repo_view` and `file_read`).
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 - [x] A single PR checks out into a managed worktree; the user's original branch and commit are verifiably unchanged
 - [x] Local branch is `pr-<number>` with the exact OMP-compatible branch metadata keys persisted

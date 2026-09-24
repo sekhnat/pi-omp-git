@@ -80,6 +80,12 @@ export class GitMutationError extends PiOmpGitError {}
 
 /** A Git hook rejected the operation; its stderr is preserved. */
 export class GitHookError extends PiOmpGitError {}
+
+/** An Actions watch failed — polling exhausted its failure budget. */
+export class ActionsWatchError extends PiOmpGitError {}
+
+/** Actions API rate limiting exhausted the poll-failure budget. */
+export class ActionsRateLimitError extends PiOmpGitError {}
 export function ensureAvailable(
 	status:
 		| { ok: true }

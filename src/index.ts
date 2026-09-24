@@ -95,6 +95,7 @@ export function createOmpGitContext(cwd?: string): OmpGitContext {
 		env: process.env,
 		cache,
 		getWorktreeRoot: () => getConfig().worktreeRoot,
+		getArtifactsRoot: () => getConfig().artifactsRoot,
 		mutationLock,
 	});
 	const commandObserver = createGhMutationInvalidator({

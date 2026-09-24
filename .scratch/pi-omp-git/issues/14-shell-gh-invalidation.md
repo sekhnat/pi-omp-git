@@ -4,7 +4,7 @@
 
 **Blocked by:** 03 (Configuration layering and the SQLite cache).
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 - [x] A `bash` tool result containing a recognized mutation verb invalidates the relevant rows before execution, even when the command fails
 - [x] Interactive `!` commands are observed through the same mechanism

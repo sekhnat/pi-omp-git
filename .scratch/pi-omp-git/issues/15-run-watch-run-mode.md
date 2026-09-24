@@ -4,12 +4,34 @@
 
 **Blocked by:** 08 (`github` dispatcher with `repo_view` and `file_read`).
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] Run ID and Actions URL forms both work; a URL/repo conflict errors rather than operating on the wrong repository
-- [ ] Poll cadences are exact: 3s for the first 60s, 15s after; time is injected in tests, never slept
-- [ ] Completion semantics: success/neutral/skipped succeed; all failure-like outcomes are detected
-- [ ] The failure grace period waits 5 seconds and refetches so parallel failures appear together
-- [ ] Failed jobs: captured log tail inlined (15 default, max 200); full captured logs persisted as artifacts with the reference returned; a log-download failure yields "Log unavailable" without failing the watch
-- [ ] Streaming progress updates flow during the watch, and the final result is valid plain text without rich rendering
-- [ ] AbortSignal cancellation stops polling and terminates child processes; the poll-failure budget treats rate-limit errors as transient
+- [x] Run ID and Actions URL forms both work; a URL/repo conflict errors rather than operating on the wrong repository
+- [x] Poll cadences are exact: 3s for the first 60s, 15s after; time is injected in tests, never slept
+- [x] Completion semantics: success/neutral/skipped succeed; all failure-like outcomes are detected
+- [x] The failure grace period waits 5 seconds and refetches so parallel failures appear together
+- [x] Failed jobs: captured log tail inlined (15 default, max 200); full captured logs persisted as artifacts with the reference returned; a log-download failure yields "Log unavailable" without failing the watch
+- [x] Streaming progress updates flow during the watch, and the final result is valid plain text without rich rendering
+- [x] AbortSignal cancellation stops polling and terminates child processes; the poll-failure budget treats rate-limit errors as transient
+
+## Comments
+
+**Implemented** (tickets 15–16 phase): `src/github/operations/run-watch.ts` —
+`parseRunIdentifier` (run ID or Actions run URL with optional attempts suffix),
+`checkRunUrlRepoConflict` (D3 pattern), `watchActions` polling engine with an
+injected `WatchClock` (virtual time in tests, never slept): 3s initial
+interval, 60s fast window, 15s slow interval, 5 consecutive-poll-failure
+budget with rate-limit stderr mapped to `ActionsRateLimitError` and other
+failures to `ActionsWatchError` (transient failures recover and reset the
+budget). Completion semantics: success/neutral/skipped succeed;
+failure/timed_out/cancelled/action_required/startup_failure fail. On first
+failed job while the watch is still live: immediate update, 5s grace, refetch
+collecting contemporaneous failures. Final collection inlines failed-job log
+tails (default 15, max 200, `tail` param floored/clamped at the dispatcher)
+and persists full captured logs under the configurable artifacts root
+(`<agentDir>/artifacts/pi-omp-git/`), returning the path; a log-download
+failure yields "Log unavailable." without failing the watch. AbortSignal is
+honored at the loop top, in `gh` spawn options (terminates child processes),
+and in sleeps. Progress streams via the tool update callback; the final
+result is plain text. Tests: `test/run-watch.test.ts` (21 tests) plus a
+dispatcher-level integration test in `test/github-dispatcher.test.ts`.

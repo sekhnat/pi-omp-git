@@ -66,6 +66,8 @@ export interface ResolvedConfig extends OmpGitSettings {
 	cacheDatabasePath: string;
 	/** Absolute managed-worktree root after environment overrides (§26). */
 	worktreeRoot: string;
+	/** Absolute root for captured log artifacts (§44). */
+	artifactsRoot: string;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -227,5 +229,6 @@ export function loadConfig(options: LoadConfigOptions): ResolvedConfig {
 			envPath ??
 			join(options.agentDir, "cache", "pi-omp-git", "github-cache.db"),
 		worktreeRoot,
+		artifactsRoot: join(options.agentDir, "artifacts", "pi-omp-git"),
 	};
 }

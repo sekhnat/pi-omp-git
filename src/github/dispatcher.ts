@@ -37,6 +37,11 @@ import { createPullRequest } from "./operations/pr-create.ts";
 import { pushPullRequest } from "./operations/pr-push.ts";
 import { fetchRepoView, renderRepoView } from "./operations/repo-view.ts";
 import {
+	type RunWatchDetails,
+	type RunWatchRunState,
+	watchActions,
+} from "./operations/run-watch.ts";
+import {
 	fetchSearch,
 	parseSearchLimit,
 	type SearchOperation,
@@ -206,6 +211,24 @@ export const GithubToolParams = Type.Object({
 				"pr_push: push with --force-with-lease. Plain --force does not exist in this surface.",
 		}),
 	),
+	run: Type.Optional(
+		Type.String({
+			description:
+				"run_watch: Actions run ID or run URL. Omit for commit mode.",
+		}),
+	),
+	commit: Type.Optional(
+		Type.String({
+			description:
+				"run_watch commit mode: commit SHA. Defaults to the last checkout's head SHA, then current HEAD.",
+		}),
+	),
+	tail: Type.Optional(
+		Type.Number({
+			description:
+				"run_watch: inline log-tail lines for failed jobs (default 15, max 200).",
+		}),
+	),
 });
 
 export type GithubToolArguments = Static<typeof GithubToolParams>;
@@ -240,6 +263,16 @@ export interface GithubToolDetails {
 	resolvedBy?: string;
 	/** pr_push: the remote the branch was pushed to. */
 	pushRemote?: string;
+	/** run_watch: the watched run ID (run mode). */
+	runId?: number;
+	/** run_watch: the watched commit SHA (commit mode). */
+	commitSha?: string;
+	/** run_watch: final outcome classification. */
+	outcome?: "success" | "failure" | "no-runs";
+	/** run_watch: elapsed watch seconds. */
+	elapsedSeconds?: number;
+	/** run_watch: per-run state with jobs, log tails, artifact paths. */
+	runs?: RunWatchRunState[];
 }
 
 /** The slice of Pi's tool context the dispatcher consumes. */
@@ -265,6 +298,10 @@ export interface GithubToolDeps {
 	cache?: GithubCache;
 	/** Absolute managed-worktree root (config-resolved, §26). */
 	getWorktreeRoot?: () => string;
+	/** Absolute root for captured Actions log artifacts (§44). */
+	getArtifactsRoot?: () => string;
+	/** Injected time for run_watch polling (tests, §98). */
+	clock?: import("./operations/run-watch.ts").WatchClock;
 	/** Shared-repository mutation lock (§31); a fresh lock by default. */
 	mutationLock?: RepositoryMutationLock;
 }
@@ -292,7 +329,7 @@ Operations:
 - pr_checkout: check one PR (or a batch) out into dedicated managed worktrees — never touching the current checkout; the result's worktreePath is where edits happen via absolute paths.
 - pr_push: push a pr_checkout-prepared branch back to its PR; resolves by explicit pr/branch, the session's last checkout, or current-branch metadata.
 - search_issues / search_prs / search_code / search_commits / search_repos: GitHub searches — GitHub query syntax reaches the API unaltered; results render agent-useful fields with canonical URLs. Issues/PRs/code/commits scope to the current checkout unless the query already declares repo:/org:/user:/owner: scope.
-(Upcoming operations: run_watch.)
+- run_watch: watch GitHub Actions — a specific run (run ID or run URL) or every workflow run for a commit (explicit commit/pr, else the session's last checkout, else current HEAD). Failed jobs surface with inline log tails and full-log artifact paths; progress streams while polling.
 
 Use repo_view to orient in an unfamiliar repository, file_read instead of curl/wget for files stored in GitHub repositories, and the search_* operations instead of scraping pages. After pr_checkout, edit files under the returned worktree path using absolute paths.`;
 
@@ -328,6 +365,8 @@ export function validateGithubArguments(params: unknown): GithubToolArguments {
 		"title",
 		"base",
 		"head",
+		"run",
+		"commit",
 	] as const) {
 		const value = record[field];
 		if (value === undefined || value === null) continue;
@@ -384,6 +423,16 @@ export function validateGithubArguments(params: unknown): GithubToolArguments {
 			);
 		}
 		validated[field] = value;
+	}
+	// §44: the run_watch log tail is a number of lines.
+	const tailValue = record.tail;
+	if (tailValue !== undefined && tailValue !== null) {
+		if (typeof tailValue !== "number") {
+			throw new GithubParamsError(
+				"The `tail` parameter must be a positive number of log lines (max 200).",
+			);
+		}
+		validated.tail = tailValue;
 	}
 	// §24: `pr` values are text — a number as a string, a PR URL, or a
 	// branch-like identifier. JSON numbers are rejected outright.
@@ -448,11 +497,35 @@ export function validateGithubArguments(params: unknown): GithubToolArguments {
 			"The `pr_checkout` operation requires the `pr` parameter — a PR number as a string, a PR URL, or a branch-like identifier.",
 		);
 	}
-	// §110: pr_push accepts a single PR; arrays are pr_checkout batching alone.
-	if (operation === "pr_push" && Array.isArray(validated.pr)) {
+	// §110: pr_push and run_watch accept a single PR; arrays are
+	// pr_checkout batching alone.
+	if (
+		(operation === "pr_push" || operation === "run_watch") &&
+		Array.isArray(validated.pr)
+	) {
 		throw new GithubParamsError(
-			"pr_push accepts a single PR; the array form of `pr` is valid for pr_checkout batching only.",
+			`${operation} accepts a single PR; the array form of \`pr\` is valid for pr_checkout batching only.`,
 		);
+	}
+	// §40: run mode and commit mode are mutually exclusive.
+	if (
+		operation === "run_watch" &&
+		typeof validated.run === "string" &&
+		(typeof validated.commit === "string" || typeof validated.pr === "string")
+	) {
+		throw new GithubParamsError(
+			"run_watch accepts either `run` (run mode) or `commit`/`pr` (commit mode), not both.",
+		);
+	}
+	// §44: the log tail is a bounded line count.
+	if (validated.tail !== undefined) {
+		const tail = validated.tail;
+		if (typeof tail !== "number" || !Number.isFinite(tail) || tail <= 0) {
+			throw new GithubParamsError(
+				"The `tail` parameter must be a positive number of log lines (max 200).",
+			);
+		}
+		validated.tail = Math.min(200, Math.floor(tail));
 	}
 	return validated;
 }
@@ -463,6 +536,7 @@ export async function executeGithubOperation(
 	params: GithubToolArguments,
 	signal?: AbortSignal,
 	ctx?: GithubToolContext,
+	onUpdate?: AgentToolUpdateCallback<GithubToolDetails>,
 ): Promise<{
 	content: AgentToolResult<GithubToolDetails>["content"];
 	details: GithubToolDetails;
@@ -631,6 +705,65 @@ export async function executeGithubOperation(
 			};
 		}
 
+		case "run_watch": {
+			const watch = await watchActions(
+				{
+					gh: deps.gh,
+					git: deps.git,
+					env: deps.env,
+					cwd: ctx?.cwd ?? process.cwd(),
+					getLastCheckout: ctx?.getLastCheckout,
+					artifactsDir: deps.getArtifactsRoot?.(),
+					clock: deps.clock,
+					signal,
+					onUpdate: (update: RunWatchDetails) => {
+						onUpdate?.({
+							content: [],
+							details: {
+								op: "run_watch",
+								repo: update.repo,
+								...(update.run !== undefined ? { runId: update.run } : {}),
+								...(update.commit !== undefined
+									? { commitSha: update.commit }
+									: {}),
+								...(update.status !== undefined
+									? { status: update.status }
+									: {}),
+								...(update.elapsedSeconds !== undefined
+									? { elapsedSeconds: update.elapsedSeconds }
+									: {}),
+								...(update.runs !== undefined ? { runs: update.runs } : {}),
+							},
+						});
+					},
+				},
+				{
+					run: params.run,
+					commit: params.commit,
+					pr: typeof params.pr === "string" ? params.pr : undefined,
+					repo: params.repo,
+					tail: params.tail,
+				},
+			);
+			const watchDetails: GithubToolDetails = {
+				op: "run_watch",
+				repo: watch.details.repo,
+				...(watch.details.run !== undefined
+					? { runId: watch.details.run }
+					: {}),
+				...(watch.details.commit !== undefined
+					? { commitSha: watch.details.commit }
+					: {}),
+				outcome: watch.details.outcome,
+				elapsedSeconds: watch.details.elapsedSeconds,
+				runs: watch.details.runs,
+			};
+			return {
+				content: [{ type: "text", text: watch.text }],
+				details: watchDetails,
+			};
+		}
+
 		default: {
 			if (!(SEARCH_OPERATIONS as readonly string[]).includes(params.op)) {
 				throw new GithubParamsError(
@@ -672,9 +805,9 @@ export function createGithubTool(deps: GithubToolDeps): GithubTool {
 		label: "github",
 		description: TOOL_DESCRIPTION,
 		parameters: GithubToolParams,
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const validated = validateGithubArguments(params);
-			return executeGithubOperation(deps, validated, signal, ctx);
+			return executeGithubOperation(deps, validated, signal, ctx, onUpdate);
 		},
 	};
 }

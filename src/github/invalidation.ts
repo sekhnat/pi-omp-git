@@ -167,7 +167,6 @@ function detectOne(segment: string): GhMutationTarget | null {
 	return target;
 }
 
-
 export interface GhMutationInvalidatorDeps {
 	cache: GithubCache;
 	env: NodeJS.ProcessEnv;

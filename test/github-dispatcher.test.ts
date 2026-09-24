@@ -12,7 +12,6 @@ import { createGitRunner } from "../src/git/runner.ts";
 import { createAvailability } from "../src/github/availability.ts";
 import {
 	createGithubTool,
-	executeGithubOperation,
 	GITHUB_OPERATIONS,
 	type GithubTool,
 } from "../src/github/dispatcher.ts";
@@ -153,13 +152,30 @@ describe("github dispatcher validation", () => {
 		);
 	});
 
-	it("reports unimplemented operations clearly", async () => {
+	it("validates run_watch parameters (§40, §44)", async () => {
 		const { tool } = buildTool();
-		// pr_checkout/pr_push arrive with tickets 11 and 13; run_watch is
-		// the remaining unimplemented §18 surface.
-		await expect(callGithub(tool, { op: "run_watch" })).rejects.toThrow(
-			/not available in this build/i,
-		);
+		// The array form of `pr` is pr_checkout batching alone.
+		await expect(
+			callGithub(tool, { op: "run_watch", pr: ["1", "2"] }),
+		).rejects.toThrow(/single PR/);
+		// Run mode and commit mode are mutually exclusive.
+		await expect(
+			callGithub(tool, { op: "run_watch", run: "100", commit: "abc" }),
+		).rejects.toThrow(/either `run`|run.*commit/s);
+		// The log tail is a bounded positive count.
+		await expect(
+			callGithub(tool, { op: "run_watch", run: "100", tail: 0 }),
+		).rejects.toThrow(/positive number of log lines/);
+		await expect(
+			callGithub(tool, { op: "run_watch", run: "100", tail: -3 }),
+		).rejects.toThrow(/positive number of log lines/);
+		await expect(
+			callGithub(tool, { op: "run_watch", run: "100", tail: "lots" }),
+		).rejects.toThrow(/positive number of log lines/);
+		// A malformed run identifier is rejected before any polling.
+		await expect(
+			callGithub(tool, { op: "run_watch", run: "not-a-run" }),
+		).rejects.toThrow(/run ID or a GitHub Actions run URL/);
 	});
 
 	it("rejects empty and mistyped parameters", async () => {
@@ -1203,30 +1219,47 @@ describe("file_read helpers", () => {
 });
 
 describe("executeGithubOperation", () => {
-	it("carries the operation context in details", async () => {
-		const deps = {
-			gh: createGhRunner({
-				exec: () => {
-					throw new Error("unused");
+	it("run_watch: a completed run returns its outcome in text and details", async () => {
+		const runPayload = {
+			databaseId: 100,
+			status: "completed",
+			conclusion: "success",
+			displayTitle: "ci: unit tests",
+			workflowName: "CI",
+			headBranch: "main",
+			headSha: "abc123",
+			url: "https://github.com/owner/repo/actions/runs/100",
+			jobs: [
+				{
+					databaseId: 11,
+					name: "build",
+					status: "completed",
+					conclusion: "success",
 				},
-			}),
-			git: createGitRunner({
-				exec: () => {
-					throw new Error("unused");
-				},
-			}),
-			availability: {
-				gh: async () => ({ ok: true as const }),
-				git: async () => ({ ok: true as const }),
-				reset: () => {},
-				ensureGh: async () => {},
-				ensureGit: async () => {},
-			},
-			env: {},
+			],
 		};
-		await expect(
-			executeGithubOperation(deps, { op: "run_watch" }),
-		).rejects.toThrow(/not available in this build/i);
+		const { tool } = buildTool({
+			"gh run view 100 -R owner/repo --json status,conclusion,displayTitle,workflowName,headBranch,headSha,url,jobs,databaseId":
+				{
+					stdout: JSON.stringify(runPayload),
+				},
+		});
+		const outcome = await callGithub(tool, {
+			op: "run_watch",
+			run: "100",
+			repo: "owner/repo",
+		});
+		expect(outcome.details).toMatchObject({
+			op: "run_watch",
+			repo: "owner/repo",
+			runId: 100,
+			outcome: "success",
+		});
+		const text = outcome.content
+			.map((part) => (part.type === "text" ? part.text : ""))
+			.join("");
+		expect(text).toContain("succeeded");
+		expect(text).toContain("ci: unit tests");
 	});
 });
 

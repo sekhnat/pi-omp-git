@@ -4,7 +4,7 @@
 
 **Blocked by:** 11 (`pr_checkout` single PR with managed worktree and mutation lock), 03 (Configuration layering and the SQLite cache).
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 - [x] Missing branch metadata produces the deterministic metadata error; no contributor-branch guessing
 - [x] Resolution order: explicit parameter → last checkout (survives session resume) → current-branch metadata → error; arrays are rejected
