@@ -12,8 +12,12 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 import { createReadTool } from "@earendil-works/pi-coding-agent";
+import { runCommitPipeline } from "./git/commit-pipeline.ts";
 import { createMutationLock } from "./git/mutation-lock.ts";
 import { collectRevisionStatus, resolveRevision } from "./git/revision.ts";
 import { createGitRunner, type GitRunner } from "./git/runner.ts";
@@ -45,7 +49,11 @@ import {
 	type GithubReadOverride,
 } from "./github/resources/router.ts";
 import { createGhRunner, type GhRunner } from "./github/runner.ts";
-import { loadConfig, type ResolvedConfig } from "./shared/config.ts";
+import {
+	COMMIT_DEFAULTS,
+	loadConfig,
+	type ResolvedConfig,
+} from "./shared/config.ts";
 import type { Runner } from "./shared/subprocess.ts";
 import { createRunner } from "./shared/subprocess.ts";
 
@@ -275,6 +283,66 @@ export default function piOmpGitExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("commit", {
+		description:
+			"Agentic commit pipeline — plans, proposes, and executes commits (--dry-run, --push, --no-changelog, --context, --model)",
+		handler: async (args, commandCtx) => {
+			const options = parseCommitArgs(args ?? "");
+			const settings = ctx.getConfig().commit;
+			// §78: split plans under `confirm` need the interactive dialog.
+			const confirmPlan =
+				settings.splitPolicy === "confirm" && commandCtx.hasUI
+					? (plan: string) =>
+							commandCtx.ui.confirm("Apply this commit plan?", plan)
+					: undefined;
+			try {
+				await ctx.availability.git();
+				const model = await resolveCommitModel(options.model, commandCtx);
+				const result = await runCommitPipeline(
+					{
+						git: ctx.git,
+						gh: ctx.gh,
+						cwd: commandCtx.cwd,
+						model,
+						signal: commandCtx.signal,
+						settings: {
+							splitPolicy: settings.splitPolicy ?? COMMIT_DEFAULTS.splitPolicy,
+							analyzeFilesEnabled:
+								settings.analyzeFilesEnabled ??
+								COMMIT_DEFAULTS.analyzeFilesEnabled,
+							analyzeFilesMaxFiles:
+								settings.analyzeFilesMaxFiles ??
+								COMMIT_DEFAULTS.analyzeFilesMaxFiles,
+							analyzeFilesMaxConcurrency:
+								settings.analyzeFilesMaxConcurrency ??
+								COMMIT_DEFAULTS.analyzeFilesMaxConcurrency,
+							changelog: settings.changelog ?? COMMIT_DEFAULTS.changelog,
+							changelogMaxDiffChars:
+								settings.changelogMaxDiffChars ??
+								COMMIT_DEFAULTS.changelogMaxDiffChars,
+							dryRunAnalyzeFiles:
+								settings.dryRunAnalyzeFiles ??
+								COMMIT_DEFAULTS.dryRunAnalyzeFiles,
+						},
+					},
+					{
+						...(options.dryRun ? { dryRun: true } : {}),
+						...(options.push ? { push: true } : {}),
+						...(options.noChangelog ? { noChangelog: true } : {}),
+						...(options.context ? { context: options.context } : {}),
+						...(confirmPlan ? { confirmPlan } : {}),
+					},
+				);
+				commandCtx.ui.notify(result.text, "info");
+			} catch (error) {
+				commandCtx.ui.notify(
+					error instanceof Error ? error.message : String(error),
+					"error",
+				);
+			}
+		},
+	});
+
 	pi.registerCommand("omp-git-doctor", {
 		description: "Report git and gh availability for pi-omp-git",
 		handler: async (_args, commandCtx) => {
@@ -290,4 +358,70 @@ export default function piOmpGitExtension(pi: ExtensionAPI): void {
 			commandCtx.ui.notify(lines.join("\n"), "info");
 		},
 	});
+}
+
+/** Parse `/commit` flags (§73): --dry-run, --push, --no-changelog, --context, --model. */
+export function parseCommitArgs(input: string): {
+	dryRun: boolean;
+	push: boolean;
+	noChangelog: boolean;
+	context?: string;
+	model?: string;
+} {
+	const tokens = input.split(/\s+/).filter((token) => token.length > 0);
+	const result: {
+		dryRun: boolean;
+		push: boolean;
+		noChangelog: boolean;
+		context?: string;
+		model?: string;
+	} = { dryRun: false, push: false, noChangelog: false };
+	for (let index = 0; index < tokens.length; index += 1) {
+		const token = tokens[index];
+		if (token === undefined) continue;
+		if (token === "--dry-run") result.dryRun = true;
+		else if (token === "--push") result.push = true;
+		else if (token === "--no-changelog") result.noChangelog = true;
+		else if (token === "--context") {
+			const value = tokens[index + 1];
+			if (value !== undefined) {
+				result.context = value;
+				index += 1;
+			}
+		} else if (token === "--model") {
+			const value = tokens[index + 1];
+			if (value !== undefined) {
+				result.model = value;
+				index += 1;
+			}
+		} else if (token.startsWith("--context=")) {
+			result.context = token.slice("--context=".length);
+		} else if (token.startsWith("--model=")) {
+			result.model = token.slice("--model=".length);
+		}
+	}
+	return result;
+}
+
+/**
+ * Resolve `--model` against the session's model registry; without it the
+ * default is the current session's model (ADR 0004, §75).
+ */
+async function resolveCommitModel(
+	requested: string | undefined,
+	commandCtx: ExtensionCommandContext,
+): Promise<ExtensionCommandContext["model"]> {
+	if (!requested) return commandCtx.model;
+	await commandCtx.modelRegistry.refresh();
+	const wanted = requested.toLowerCase();
+	const candidates = commandCtx.modelRegistry.getAll();
+	const direct = candidates.find((model) => model.id.toLowerCase() === wanted);
+	if (direct) return direct;
+	const qualified = candidates.find(
+		(model) => `${model.provider}/${model.id}`.toLowerCase() === wanted,
+	);
+	if (qualified) return qualified;
+	throw new Error(
+		`Unknown model: ${requested}. Use a model id (or provider/id) known to this session.`,
+	);
 }

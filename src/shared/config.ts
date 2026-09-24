@@ -29,10 +29,36 @@ export interface WorktreeSettings {
 	root?: string;
 }
 
+/** §76/§78/§81/§82 commit-pipeline settings. */
+export interface CommitSettings {
+	/** confirm | auto | never (§78); confirm requires an interactive UI. */
+	splitPolicy?: "confirm" | "auto" | "never";
+	/** Per-file subagent analysis fan-out (§76, divergence D5). */
+	analyzeFilesEnabled?: boolean;
+	analyzeFilesMaxFiles?: number;
+	analyzeFilesMaxConcurrency?: number;
+	/** Changelog integration (§81). */
+	changelog?: boolean;
+	changelogMaxDiffChars?: number;
+	/** Avoid expensive per-file subagents during preview (§82). */
+	dryRunAnalyzeFiles?: boolean;
+}
+
 export interface OmpGitSettings {
 	github: GithubSettings;
 	worktree: WorktreeSettings;
+	commit: CommitSettings;
 }
+
+export const COMMIT_DEFAULTS: Required<CommitSettings> = {
+	splitPolicy: "confirm",
+	analyzeFilesEnabled: true,
+	analyzeFilesMaxFiles: 8,
+	analyzeFilesMaxConcurrency: 4,
+	changelog: true,
+	changelogMaxDiffChars: 2000,
+	dryRunAnalyzeFiles: false,
+};
 
 export const CONFIG_DEFAULTS: OmpGitSettings = {
 	github: {
@@ -47,6 +73,7 @@ export const CONFIG_DEFAULTS: OmpGitSettings = {
 		// §26 default managed-worktree root: <agentDir>/worktrees
 		root: undefined,
 	},
+	commit: {},
 };
 
 export const CONFIG_FILE_NAME = "pi-omp-git.json";
@@ -71,6 +98,20 @@ export interface ResolvedConfig extends OmpGitSettings {
 }
 
 type UnknownRecord = Record<string, unknown>;
+
+function pickSplitPolicy(
+	layers: UnknownRecord[],
+): CommitSettings["splitPolicy"] {
+	for (const layer of layers) {
+		const commit = layer.commit;
+		if (commit === null || typeof commit !== "object") continue;
+		const value = (commit as UnknownRecord).splitPolicy;
+		if (value === "confirm" || value === "auto" || value === "never") {
+			return value;
+		}
+	}
+	return undefined;
+}
 
 function readJsonFile(path: string): UnknownRecord {
 	try {
@@ -172,6 +213,42 @@ export function loadConfig(options: LoadConfigOptions): ResolvedConfig {
 		worktree: {
 			root: pickString(layers, ["worktree", "root"]),
 		},
+		commit: {
+			splitPolicy: pickSplitPolicy(layers),
+			analyzeFilesEnabled: pickBoolean(
+				layers,
+				["commit", "analyzeFilesEnabled"],
+				COMMIT_DEFAULTS.analyzeFilesEnabled,
+			),
+			analyzeFilesMaxFiles: pickInteger(
+				layers,
+				["commit", "analyzeFilesMaxFiles"],
+				COMMIT_DEFAULTS.analyzeFilesMaxFiles,
+				1,
+			),
+			analyzeFilesMaxConcurrency: pickInteger(
+				layers,
+				["commit", "analyzeFilesMaxConcurrency"],
+				COMMIT_DEFAULTS.analyzeFilesMaxConcurrency,
+				1,
+			),
+			changelog: pickBoolean(
+				layers,
+				["commit", "changelog"],
+				COMMIT_DEFAULTS.changelog,
+			),
+			changelogMaxDiffChars: pickInteger(
+				layers,
+				["commit", "changelogMaxDiffChars"],
+				COMMIT_DEFAULTS.changelogMaxDiffChars,
+				1,
+			),
+			dryRunAnalyzeFiles: pickBoolean(
+				layers,
+				["commit", "dryRunAnalyzeFiles"],
+				COMMIT_DEFAULTS.dryRunAnalyzeFiles,
+			),
+		},
 		github: {
 			enabled: pickBoolean(
 				layers,
@@ -219,8 +296,15 @@ export function loadConfig(options: LoadConfigOptions): ResolvedConfig {
 		settings.worktree.root ??
 		join(options.agentDir, "worktrees");
 
+	const splitPolicy =
+		settings.commit.splitPolicy ?? COMMIT_DEFAULTS.splitPolicy;
+
 	return {
 		...settings,
+		commit: {
+			...settings.commit,
+			splitPolicy,
+		},
 		github: {
 			...settings.github,
 			cache: { ...settings.github.cache, hardTtlSec },

@@ -86,6 +86,8 @@ export class ActionsWatchError extends PiOmpGitError {}
 
 /** Actions API rate limiting exhausted the poll-failure budget. */
 export class ActionsRateLimitError extends PiOmpGitError {}
+export class CommitProposalError extends PiOmpGitError {}
+export class CommitExecutionError extends PiOmpGitError {}
 export function ensureAvailable(
 	status:
 		| { ok: true }
