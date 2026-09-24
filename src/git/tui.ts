@@ -1,6 +1,6 @@
 /**
  * `/git` TUI: controller plus component (docs/pi-omp-git-reference.md
- * §60–§61, §64–§66, tickets 17–18).
+ * §60–§61, §64–§67, §72, tickets 17–19).
  *
  * The controller owns selection state and dispatches model operations,
  * refreshing from Git after every mutation. It is fully headless — the
@@ -11,6 +11,11 @@
 
 import type { Component } from "@earendil-works/pi-tui";
 import { matchesKey } from "@earendil-works/pi-tui";
+import {
+	type CommitOpsDeps,
+	executeCommit,
+	generateCommitMessage,
+} from "./commit-ops.ts";
 import {
 	discardAllWarning,
 	discardFileHunk,
@@ -23,6 +28,11 @@ import {
 	unstageFileHunk,
 	unstageFilePath,
 } from "./model-ops.ts";
+import {
+	collectRevisionStatus,
+	fetchRevisionFileDiff,
+	type RevisionUiState,
+} from "./revision.ts";
 import type { GitRunner } from "./runner.ts";
 import {
 	type FileDiff,
@@ -61,15 +71,46 @@ export class GitTuiController {
 		hunk?: number;
 		prompt: string;
 	} | null = null;
+	/** Commit composer state (§72); non-null while composing. */
+	composer: {
+		text: string;
+		cursor: number;
+		amend: boolean;
+		generating: boolean;
+	} | null = null;
+	/** Revision mode state (§67); non-null turns the UI read-only. */
+	revisionState: RevisionUiState | null;
 	private diffSide: "staged" | "unstaged" = "unstaged";
 	private diffPath: string | null = null;
 
 	constructor(
-		private options: { git: GitRunner; cwd: string; onChange?: () => void },
+		private options: {
+			git: GitRunner;
+			cwd: string;
+			onChange?: () => void;
+			/** Parent session model for AI message generation (§72). */
+			model?: CommitOpsDeps["model"];
+			createNestedSession?: CommitOpsDeps["createNestedSession"];
+		},
 		initialState: GitUiState,
+		revisionState?: RevisionUiState | null,
 	) {
 		this.state = initialState;
+		this.revisionState = revisionState ?? null;
 		this.rebuildRows();
+	}
+
+	isRevisionMode(): boolean {
+		return this.revisionState !== null;
+	}
+
+	private commitOps(): CommitOpsDeps {
+		return {
+			git: this.options.git,
+			cwd: this.options.cwd,
+			model: this.options.model,
+			createNestedSession: this.options.createNestedSession,
+		};
 	}
 
 	private ops(): OpsDeps {
@@ -83,6 +124,20 @@ export class GitTuiController {
 
 	private rebuildRows(): void {
 		const rows: FileRow[] = [];
+		if (this.revisionState) {
+			for (const file of this.revisionState.files) {
+				rows.push({
+					area: "unstaged",
+					path: file.path,
+					label: `${file.state} ${file.path}${file.binary ? " [binary]" : file.lfs ? " [LFS]" : ""}`,
+				});
+			}
+			this.rows = rows;
+			if (this.selectedRow >= rows.length) {
+				this.selectedRow = Math.max(0, rows.length - 1);
+			}
+			return;
+		}
 		const label = (
 			state: string,
 			path: string,
@@ -120,6 +175,17 @@ export class GitTuiController {
 
 	/** Re-read the full state model from Git (§62). */
 	async refresh(): Promise<void> {
+		if (this.revisionState) {
+			this.revisionState = await collectRevisionStatus(
+				{ git: this.options.git },
+				this.options.cwd,
+				this.revisionState.revision,
+			);
+			this.rebuildRows();
+			this.diffPath = null;
+			await this.loadDiff();
+			return;
+		}
 		const selection = this.currentSelection();
 		this.state = await refreshGitState(
 			{ git: this.options.git },
@@ -172,6 +238,7 @@ export class GitTuiController {
 	}
 
 	switchArea(): void {
+		if (this.revisionState) return;
 		const order: Area[] = ["unstaged", "staged", "conflicts"];
 		const current = this.currentArea() ?? "unstaged";
 		const target = order[(order.indexOf(current) + 1) % order.length];
@@ -212,6 +279,21 @@ export class GitTuiController {
 		const area = this.currentArea();
 		if (!path || !area || area === "conflicts") {
 			this.diff = null;
+			return;
+		}
+		if (this.revisionState) {
+			if (this.diffPath === path && this.diff) return;
+			try {
+				this.diff = await fetchRevisionFileDiff(
+					{ git: this.options.git },
+					this.revisionState,
+					path,
+				);
+				this.diffPath = path;
+			} catch (error) {
+				this.message = error instanceof Error ? error.message : String(error);
+				this.diff = null;
+			}
 			return;
 		}
 		const side: "staged" | "unstaged" =
@@ -268,6 +350,11 @@ export class GitTuiController {
 		const path = this.currentPath();
 		const area = this.currentArea();
 		if (!path || !area) return;
+		if (this.revisionState) {
+			this.message =
+				"Revision mode is read-only — working-tree mutations are disabled.";
+			return;
+		}
 		if (area === "conflicts") {
 			this.message =
 				"Conflicted files cannot be staged or discarded here — resolve the conflict first.";
@@ -332,10 +419,13 @@ export class GitTuiController {
 	}
 
 	/** Run an action, then refresh state from Git and reload the diff. */
-	private async run(action: () => Promise<void>): Promise<void> {
+	private async run<T>(
+		action: () => Promise<T>,
+		after?: (result: T) => string | null,
+	): Promise<void> {
 		try {
-			await action();
-			this.message = null;
+			const result = await action();
+			this.message = after ? after(result) : null;
 			await this.refresh();
 		} catch (error) {
 			this.message = error instanceof Error ? error.message : String(error);
@@ -352,6 +442,115 @@ export class GitTuiController {
 
 	refreshNow(): void {
 		void this.run(async () => {});
+	}
+
+	// ── Commit composer (§72) ─────────────────────────────────────────
+
+	/**
+	 * Open the composer. With nothing staged it opens anyway so amend
+	 * stays reachable; committing an empty staged set surfaces git's own
+	 * "nothing to commit" error honestly.
+	 */
+	openComposer(): void {
+		if (this.revisionState) {
+			this.message = "Revision mode is read-only — committing is disabled.";
+			return;
+		}
+		if (this.composer) return;
+		this.composer = { text: "", cursor: 0, amend: false, generating: false };
+		this.message =
+			this.state.staged.length === 0
+				? "Nothing staged — press a for amend, or Escape to cancel."
+				: null;
+	}
+
+	closeComposer(): void {
+		this.composer = null;
+		this.message = null;
+	}
+
+	toggleAmend(): void {
+		if (!this.composer) return;
+		this.composer.amend = !this.composer.amend;
+	}
+
+	/** AI-generated Conventional Commits message, editable afterwards (§72). */
+	generateMessage(): void {
+		const composer = this.composer;
+		if (!composer || composer.generating) return;
+		composer.generating = true;
+		void this.run(
+			async () => {
+				const message = await generateCommitMessage(this.commitOps(), {
+					amend: composer.amend,
+				});
+				composer.text = message;
+				composer.cursor = message.length;
+			},
+			() => "Generated commit message — edit it, then press Enter.",
+		).finally(() => {
+			composer.generating = false;
+		});
+	}
+
+	/** Execute the composed commit; success is proven by HEAD movement. */
+	commitNow(): void {
+		const composer = this.composer;
+		if (!composer) return;
+		void this.run(
+			async () => {
+				const outcome = await executeCommit(this.commitOps(), {
+					message: composer.text,
+					amend: composer.amend,
+				});
+				this.composer = null;
+				return outcome;
+			},
+			(outcome) =>
+				outcome
+					? `${outcome.amend ? "Amended" : "Committed"} ${outcome.short}.`
+					: null,
+		);
+	}
+
+	// Minimal editable buffer for the composer (§72: user can edit the
+	// generated text before execution).
+
+	composerInsert(text: string): void {
+		if (!this.composer) return;
+		const { text: current, cursor } = this.composer;
+		this.composer.text =
+			current.slice(0, cursor) + text + current.slice(cursor);
+		this.composer.cursor = cursor + text.length;
+	}
+
+	composerBackspace(): void {
+		if (!this.composer || this.composer.cursor === 0) return;
+		const { text, cursor } = this.composer;
+		this.composer.text = text.slice(0, cursor - 1) + text.slice(cursor);
+		this.composer.cursor = cursor - 1;
+	}
+
+	composerMove(delta: -1 | 1): void {
+		if (!this.composer) return;
+		this.composer.cursor = Math.min(
+			this.composer.text.length,
+			Math.max(0, this.composer.cursor + delta),
+		);
+	}
+
+	composerMoveLine(delta: -1 | 1): void {
+		if (!this.composer) return;
+		const { text, cursor } = this.composer;
+		const lineStarts = [0];
+		for (let index = 0; index < text.length; index += 1) {
+			if (text[index] === "\n") lineStarts.push(index + 1);
+		}
+		const currentLine =
+			lineStarts.filter((start) => start <= cursor).length - 1;
+		const target = currentLine + delta;
+		if (target < 0 || target >= lineStarts.length) return;
+		this.composer.cursor = lineStarts[target] ?? 0;
 	}
 }
 
@@ -373,17 +572,27 @@ export function renderGitTui(
 	height: number,
 ): string[] {
 	const state = controller.state;
+	const revision = controller.revisionState;
 	const repoName = state.root.split("/").filter(Boolean).pop() ?? state.root;
 	const headShort = state.head ? state.head.slice(0, 8) : "—";
 	const lines: string[] = [];
 
-	// Header: repository / branch / HEAD.
-	lines.push(
-		truncate(
-			`${repoName} — ${state.branch ?? "(detached)"} @ ${headShort}`,
-			width,
-		),
-	);
+	// Header: repository / branch / HEAD, or the inspected revision (§67).
+	if (revision) {
+		lines.push(
+			truncate(
+				`${repoName} — revision ${revision.revision.ref} @ ${revision.revision.commit.slice(0, 8)} — ${revision.revision.subject} (read-only)`,
+				width,
+			),
+		);
+	} else {
+		lines.push(
+			truncate(
+				`${repoName} — ${state.branch ?? "(detached)"} @ ${headShort}`,
+				width,
+			),
+		);
+	}
 	lines.push("─".repeat(Math.max(0, width)));
 
 	// Sidebar rows with section headers.
@@ -391,11 +600,13 @@ export function renderGitTui(
 	const diffWidth = Math.max(20, width - sidebarWidth - 1);
 
 	const sidebar: string[] = [];
-	const sections: Array<{ title: string; area: Area }> = [
-		{ title: "Staged", area: "staged" },
-		{ title: "Unstaged", area: "unstaged" },
-		{ title: "Conflicts", area: "conflicts" },
-	];
+	const sections: Array<{ title: string; area: Area }> = revision
+		? [{ title: `Changes in ${revision.revision.ref}`, area: "unstaged" }]
+		: [
+				{ title: "Staged", area: "staged" },
+				{ title: "Unstaged", area: "unstaged" },
+				{ title: "Conflicts", area: "conflicts" },
+			];
 	for (const section of sections) {
 		const entries = controller.rows.filter((row) => row.area === section.area);
 		sidebar.push(`${section.title} (${entries.length})`);
@@ -478,6 +689,33 @@ export function renderGitTui(
 		lines.push(`${left}│${right}`);
 	}
 
+	// Commit composer panel (§72).
+	if (controller.composer) {
+		lines.push("─".repeat(Math.max(0, width)));
+		const composer = controller.composer;
+		const header = composer.generating
+			? `Commit message${composer.amend ? " (amend)" : ""} — generating…`
+			: `Commit message${composer.amend ? " (amend)" : ""} — [Enter] commit [Esc] cancel [g] generate [a] amend`;
+		lines.push(truncate(header, width));
+		const textLines = composer.text.split("\n");
+		const cursor = composer.cursor;
+		let consumed = 0;
+		for (const textLine of textLines) {
+			const start = consumed;
+			const end = consumed + textLine.length;
+			let display = textLine;
+			if (cursor >= start && cursor <= end) {
+				const offset = cursor - start;
+				display = `${textLine.slice(0, offset)}▮${textLine.slice(offset)}`;
+			}
+			lines.push(truncate(display, width));
+			consumed = end + 1;
+		}
+		if (cursor >= consumed) {
+			lines.push(truncate("▮", width));
+		}
+	}
+
 	// Action / status bar.
 	lines.push("─".repeat(Math.max(0, width)));
 	if (controller.pendingConfirm) {
@@ -488,12 +726,10 @@ export function renderGitTui(
 		const mode = controller.hunkMode
 			? `hunk ${controller.selectedHunk + 1}/${controller.diff?.parsed?.hunks.length ?? 0}`
 			: "file";
-		lines.push(
-			truncate(
-				`[tab] area [↑/↓] move [h] ${controller.hunkMode ? "file" : "hunk"} mode [s]tage [u]nstage [d]iscard [r]efresh [q]uit — ${mode}`,
-				width,
-			),
-		);
+		const bar = revision
+			? `[↑/↓] move [h] ${controller.hunkMode ? "file" : "hunk"} mode [r]efresh [q]uit — read-only revision mode`
+			: `[tab] area [↑/↓] move [h] ${controller.hunkMode ? "file" : "hunk"} mode [s]tage [u]nstage [d]iscard [c]ommit [r]efresh [q]uit — ${mode}`;
+		lines.push(truncate(bar, width));
 	}
 	// Trim to the requested height, keeping the header and action bar.
 	if (lines.length > height && height > 2) {
@@ -547,6 +783,12 @@ export class GitTuiComponent implements Component {
 			this.tui.requestRender();
 			return;
 		}
+		// The composer takes over the keyboard while it is open (§72);
+		// typed characters must reach the message, not the file list.
+		if (controller.composer) {
+			this.composerInput(data);
+			return;
+		}
 		if (matchesKey(data, "up") || data === "k") {
 			if (controller.hunkMode) controller.moveHunk(-1);
 			else controller.select(-1);
@@ -590,9 +832,69 @@ export class GitTuiComponent implements Component {
 			controller.refreshNow();
 			return;
 		}
+		if (data === "c") {
+			controller.openComposer();
+			this.tui.requestRender();
+			return;
+		}
 		if (data === "q" || matchesKey(data, "escape")) {
 			this.onDone();
 			return;
+		}
+	}
+
+	/** Keyboard handling while the commit composer is open. */
+	private composerInput(data: string): void {
+		const controller = this.controller;
+		if (matchesKey(data, "escape")) {
+			controller.closeComposer();
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "enter")) {
+			controller.commitNow();
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "backspace")) {
+			controller.composerBackspace();
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "left")) {
+			controller.composerMove(-1);
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "right")) {
+			controller.composerMove(1);
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "up")) {
+			controller.composerMoveLine(-1);
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			controller.composerMoveLine(1);
+			this.tui.requestRender();
+			return;
+		}
+		// Plain keys act as editing commands; printable text is inserted.
+		if (data === "g") {
+			controller.generateMessage();
+			this.tui.requestRender();
+			return;
+		}
+		if (data === "a") {
+			controller.toggleAmend();
+			this.tui.requestRender();
+			return;
+		}
+		if (data.length === 1 && data >= " ") {
+			controller.composerInsert(data);
+			this.tui.requestRender();
 		}
 	}
 

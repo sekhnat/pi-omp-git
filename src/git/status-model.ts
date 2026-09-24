@@ -234,6 +234,17 @@ export function buildGitUiState(
 	};
 }
 
+/** An empty worktree state; used as the inert base for revision mode. */
+export function emptyGitUiState(root: string): GitUiState {
+	return {
+		root,
+		staged: [],
+		unstaged: [],
+		conflicts: [],
+		selection: { area: "unstaged" },
+	};
+}
+
 /**
  * Collect raw repository facts with real git. All git invocation lives
  * here so tests can either run real git or feed collected raw output to

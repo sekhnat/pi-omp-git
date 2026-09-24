@@ -15,11 +15,12 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createReadTool } from "@earendil-works/pi-coding-agent";
 import { createMutationLock } from "./git/mutation-lock.ts";
+import { collectRevisionStatus, resolveRevision } from "./git/revision.ts";
 import { createGitRunner, type GitRunner } from "./git/runner.ts";
 import {
 	buildGitUiState,
 	collectGitRawStatus,
-	type GitUiState,
+	emptyGitUiState,
 } from "./git/status-model.ts";
 import { GitTuiComponent, GitTuiController } from "./git/tui.ts";
 import {
@@ -207,8 +208,9 @@ export default function piOmpGitExtension(pi: ExtensionAPI): void {
 
 	// `/git` (§60–§66): interactive Git TUI over the headless state model.
 	pi.registerCommand("git", {
-		description: "Interactive Git TUI — status, diffs, stage/unstage/discard",
-		handler: async (_args, commandCtx) => {
+		description:
+			"Interactive Git TUI — status, diffs, stage/unstage/discard; /git <revision> inspects a commit read-only",
+		handler: async (args, commandCtx) => {
 			if (commandCtx.mode !== "tui") {
 				commandCtx.ui.notify(
 					"/git requires an interactive terminal — it cannot open in RPC, JSON, or print mode.",
@@ -226,10 +228,38 @@ export default function piOmpGitExtension(pi: ExtensionAPI): void {
 				);
 				return;
 			}
-			let initialState: GitUiState;
+			const revisionRef = (args ?? "").trim();
+			let controller: GitTuiController;
 			try {
-				const raw = await collectGitRawStatus({ git: ctx.git }, cwd);
-				initialState = buildGitUiState(raw);
+				if (revisionRef) {
+					// Revision mode (§67): read-only inspection of one commit.
+					const info = await resolveRevision(
+						{ git: ctx.git },
+						cwd,
+						revisionRef,
+					);
+					const revisionState = await collectRevisionStatus(
+						{ git: ctx.git },
+						cwd,
+						info,
+					);
+					controller = new GitTuiController(
+						{ git: ctx.git, cwd },
+						emptyGitUiState(cwd),
+						revisionState,
+					);
+				} else {
+					const raw = await collectGitRawStatus({ git: ctx.git }, cwd);
+					const initialState = buildGitUiState(raw);
+					controller = new GitTuiController(
+						{
+							git: ctx.git,
+							cwd,
+							model: commandCtx.model,
+						},
+						initialState,
+					);
+				}
 			} catch (error) {
 				commandCtx.ui.notify(
 					error instanceof Error ? error.message : String(error),
@@ -237,10 +267,6 @@ export default function piOmpGitExtension(pi: ExtensionAPI): void {
 				);
 				return;
 			}
-			const controller = new GitTuiController(
-				{ git: ctx.git, cwd },
-				initialState,
-			);
 			await commandCtx.ui.custom((tui, _theme, _keybindings, done) => {
 				return new GitTuiComponent(tui, controller, () => done(undefined), {
 					height: 30,
