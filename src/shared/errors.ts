@@ -26,11 +26,11 @@ export class PiOmpGitError extends Error {
 
 /** A required external binary is missing (gh, git). */
 export class DependencyError extends PiOmpGitError {
-	constructor(
-		message: string,
-		public readonly binary: "git" | "gh",
-	) {
+	readonly binary: "git" | "gh";
+
+	constructor(message: string, binary: "git" | "gh") {
 		super(message);
+		this.binary = binary;
 	}
 }
 

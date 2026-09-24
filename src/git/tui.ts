@@ -133,8 +133,17 @@ export class GitTuiController {
 	private diffSide: "staged" | "unstaged" = "unstaged";
 	private diffPath: string | null = null;
 
+	private options: {
+		git: GitRunner;
+		cwd: string;
+		onChange?: () => void;
+		/** Parent session model for AI message generation (§72). */
+		model?: CommitOpsDeps["model"];
+		createNestedSession?: CommitOpsDeps["createNestedSession"];
+	};
+
 	constructor(
-		private options: {
+		options: {
 			git: GitRunner;
 			cwd: string;
 			onChange?: () => void;
@@ -145,6 +154,7 @@ export class GitTuiController {
 		initialState: GitUiState,
 		revisionState?: RevisionUiState | null,
 	) {
+		this.options = options;
 		this.state = initialState;
 		this.revisionState = revisionState ?? null;
 		this.rebuildRows();
@@ -942,12 +952,19 @@ export function renderGitTui(
  * `component.render(width)` directly.
  */
 export class GitTuiComponent implements Component {
+	private tui: { requestRender(): void };
+	private onDone: () => void;
+	private options: { height?: number };
+
 	constructor(
-		private tui: { requestRender(): void },
+		tui: { requestRender(): void },
 		controller: GitTuiController,
-		private onDone: () => void,
-		private options: { height?: number } = {},
+		onDone: () => void,
+		options: { height?: number } = {},
 	) {
+		this.tui = tui;
+		this.onDone = onDone;
+		this.options = options;
 		// Async mutations must trigger a render when they settle.
 		controller.setOnChange(() => this.renderChanged());
 		void controller.loadDiff();

@@ -43,10 +43,12 @@ export type Exec = (spec: ExecSpec) => Promise<RunResult>;
 /** The binary was absent from PATH (mapped to the friendly dependency error). */
 export class CommandNotFoundError extends Error {
 	readonly code = "ENOENT";
+	readonly command: string;
 
-	constructor(public readonly command: string) {
+	constructor(command: string) {
 		super(`command not found: ${command}`);
 		this.name = "CommandNotFoundError";
+		this.command = command;
 	}
 }
 

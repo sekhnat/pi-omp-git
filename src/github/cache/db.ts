@@ -44,8 +44,11 @@ const FILE_MODE = 0o600;
 export class SqliteCacheStore implements CacheStore {
 	private db: DatabaseSync | null = null;
 	private degraded = false;
+	private readonly path: string;
 
-	constructor(private readonly path: string) {}
+	constructor(path: string) {
+		this.path = path;
+	}
 
 	/**
 	 * The open database, or null when degraded. Opening is lazy and
