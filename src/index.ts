@@ -17,6 +17,12 @@ import { createReadTool } from "@earendil-works/pi-coding-agent";
 import { createMutationLock } from "./git/mutation-lock.ts";
 import { createGitRunner, type GitRunner } from "./git/runner.ts";
 import {
+	buildGitUiState,
+	collectGitRawStatus,
+	type GitUiState,
+} from "./git/status-model.ts";
+import { GitTuiComponent, GitTuiController } from "./git/tui.ts";
+import {
 	type Availability,
 	createAvailability,
 } from "./github/availability.ts";
@@ -197,6 +203,50 @@ export default function piOmpGitExtension(pi: ExtensionAPI): void {
 		event.systemPromptOptions.promptGuidelines.push(
 			...GITHUB_PROMPT_GUIDELINES,
 		);
+	});
+
+	// `/git` (§60–§66): interactive Git TUI over the headless state model.
+	pi.registerCommand("git", {
+		description: "Interactive Git TUI — status, diffs, stage/unstage/discard",
+		handler: async (_args, commandCtx) => {
+			if (commandCtx.mode !== "tui") {
+				commandCtx.ui.notify(
+					"/git requires an interactive terminal — it cannot open in RPC, JSON, or print mode.",
+					"error",
+				);
+				return;
+			}
+			const cwd = commandCtx.cwd;
+			try {
+				await ctx.availability.git();
+			} catch (error) {
+				commandCtx.ui.notify(
+					error instanceof Error ? error.message : String(error),
+					"error",
+				);
+				return;
+			}
+			let initialState: GitUiState;
+			try {
+				const raw = await collectGitRawStatus({ git: ctx.git }, cwd);
+				initialState = buildGitUiState(raw);
+			} catch (error) {
+				commandCtx.ui.notify(
+					error instanceof Error ? error.message : String(error),
+					"error",
+				);
+				return;
+			}
+			const controller = new GitTuiController(
+				{ git: ctx.git, cwd },
+				initialState,
+			);
+			await commandCtx.ui.custom((tui, _theme, _keybindings, done) => {
+				return new GitTuiComponent(tui, controller, () => done(undefined), {
+					height: 30,
+				});
+			});
+		},
 	});
 
 	pi.registerCommand("omp-git-doctor", {
