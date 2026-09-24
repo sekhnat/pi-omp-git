@@ -12,6 +12,12 @@
 import type { Component } from "@earendil-works/pi-tui";
 import { matchesKey } from "@earendil-works/pi-tui";
 import {
+	type AiStageDeps,
+	applyAiStage,
+	planAiStage,
+	type StagePlan,
+} from "./ai-stage.ts";
+import {
 	type CommitOpsDeps,
 	executeCommit,
 	generateCommitMessage,
@@ -50,6 +56,46 @@ interface FileRow {
 	label: string;
 }
 
+/** Minimal single-cursor text buffer shared by the composer and prompts. */
+interface TextBuffer {
+	text: string;
+	cursor: number;
+}
+
+function bufferInsert(buffer: TextBuffer, text: string): void {
+	buffer.text =
+		buffer.text.slice(0, buffer.cursor) +
+		text +
+		buffer.text.slice(buffer.cursor);
+	buffer.cursor += text.length;
+}
+
+function bufferBackspace(buffer: TextBuffer): void {
+	if (buffer.cursor === 0) return;
+	buffer.text =
+		buffer.text.slice(0, buffer.cursor - 1) + buffer.text.slice(buffer.cursor);
+	buffer.cursor -= 1;
+}
+
+function bufferMove(buffer: TextBuffer, delta: -1 | 1): void {
+	buffer.cursor = Math.min(
+		buffer.text.length,
+		Math.max(0, buffer.cursor + delta),
+	);
+}
+
+function bufferMoveLine(buffer: TextBuffer, delta: -1 | 1): void {
+	const lineStarts = [0];
+	for (let index = 0; index < buffer.text.length; index += 1) {
+		if (buffer.text[index] === "\n") lineStarts.push(index + 1);
+	}
+	const currentLine =
+		lineStarts.filter((start) => start <= buffer.cursor).length - 1;
+	const target = currentLine + delta;
+	if (target < 0 || target >= lineStarts.length) return;
+	buffer.cursor = lineStarts[target] ?? 0;
+}
+
 /**
  * Headless controller: selection state, diff loading, and mutation
  * dispatch with refresh-after-mutation (§62: state is re-read from Git
@@ -78,6 +124,10 @@ export class GitTuiController {
 		amend: boolean;
 		generating: boolean;
 	} | null = null;
+	/** AI Stage instruction prompt (§70); non-null while typing. */
+	aiPrompt: (TextBuffer & { planning: boolean }) | null = null;
+	/** A produced staging plan awaiting explicit confirmation. */
+	pendingAiPlan: { plan: StagePlan; instruction: string } | null = null;
 	/** Revision mode state (§67); non-null turns the UI read-only. */
 	revisionState: RevisionUiState | null;
 	private diffSide: "staged" | "unstaged" = "unstaged";
@@ -105,6 +155,15 @@ export class GitTuiController {
 	}
 
 	private commitOps(): CommitOpsDeps {
+		return {
+			git: this.options.git,
+			cwd: this.options.cwd,
+			model: this.options.model,
+			createNestedSession: this.options.createNestedSession,
+		};
+	}
+
+	private aiStageDeps(): AiStageDeps {
 		return {
 			git: this.options.git,
 			cwd: this.options.cwd,
@@ -552,6 +611,102 @@ export class GitTuiController {
 		if (target < 0 || target >= lineStarts.length) return;
 		this.composer.cursor = lineStarts[target] ?? 0;
 	}
+
+	// ── AI Stage (§70) ────────────────────────────────────────────────
+
+	/** Open the natural-language staging prompt. */
+	openAiPrompt(): void {
+		if (this.revisionState) {
+			this.message = "Revision mode is read-only — AI staging is disabled.";
+			return;
+		}
+		if (this.aiPrompt || this.pendingAiPlan) return;
+		if (this.state.unstaged.length === 0) {
+			this.message = "There are no unstaged changes for AI staging.";
+			return;
+		}
+		this.aiPrompt = { text: "", cursor: 0, planning: false };
+		this.message = null;
+	}
+
+	closeAiPrompt(): void {
+		this.aiPrompt = null;
+		this.pendingAiPlan = null;
+		this.message = null;
+	}
+
+	aiInsert(text: string): void {
+		if (this.aiPrompt) bufferInsert(this.aiPrompt, text);
+	}
+
+	aiBackspace(): void {
+		if (this.aiPrompt) bufferBackspace(this.aiPrompt);
+	}
+
+	aiMove(delta: -1 | 1): void {
+		if (this.aiPrompt) bufferMove(this.aiPrompt, delta);
+	}
+
+	aiMoveLine(delta: -1 | 1): void {
+		if (this.aiPrompt) bufferMoveLine(this.aiPrompt, delta);
+	}
+
+	/** Ask the nested agent for a staging plan (read-only until confirmed). */
+	planAiStageNow(): void {
+		const prompt = this.aiPrompt;
+		if (!prompt || prompt.planning) return;
+		const instruction = prompt.text;
+		if (!instruction.trim()) {
+			this.message = "Describe what to stage first.";
+			return;
+		}
+		prompt.planning = true;
+		void this.run(
+			async () => {
+				const plan = await planAiStage(
+					this.aiStageDeps(),
+					this.state,
+					instruction,
+				);
+				this.pendingAiPlan = { plan, instruction };
+				this.aiPrompt = null;
+				return plan;
+			},
+			(plan) =>
+				plan
+					? `Staging plan ready: ${plan.files.length} file(s) — press y to apply, n to cancel.`
+					: null,
+		).finally(() => {
+			prompt.planning = false;
+		});
+	}
+
+	/** Apply the confirmed plan (§71 safety contract). */
+	confirmAiPlan(): void {
+		const pending = this.pendingAiPlan;
+		if (!pending) return;
+		void this.run(
+			async () => {
+				const outcome = await applyAiStage(
+					this.aiStageDeps(),
+					this.state,
+					pending.plan,
+					{ confirmed: true },
+				);
+				this.pendingAiPlan = null;
+				return outcome;
+			},
+			(outcome) =>
+				outcome
+					? `Staged ${outcome.stagedHunks} hunk(s) across ${outcome.stagedFiles.length} file(s).`
+					: null,
+		);
+	}
+
+	cancelAiPlan(): void {
+		this.pendingAiPlan = null;
+		this.message = null;
+	}
 }
 
 function truncate(text: string, width: number): string {
@@ -687,6 +842,47 @@ export function renderGitTui(
 		);
 		const right = truncate(diffLines[row] ?? "", diffWidth);
 		lines.push(`${left}│${right}`);
+	}
+
+	// AI staging prompt / plan panels (§70).
+	if (controller.aiPrompt) {
+		lines.push("─".repeat(Math.max(0, width)));
+		const prompt = controller.aiPrompt;
+		lines.push(
+			truncate(
+				prompt.planning
+					? "AI staging — planning…"
+					: "AI staging — describe what to stage [Enter] plan [Esc] cancel:",
+				width,
+			),
+		);
+		const cursorLine = prompt.text.slice(0, prompt.cursor);
+		const lineIndex = cursorLine.split("\n").length - 1;
+		const textLines = prompt.text.split("\n");
+		for (const [index, textLine] of textLines.entries()) {
+			const display =
+				index === lineIndex
+					? `${textLine.slice(0, prompt.cursor - cursorLine.lastIndexOf("\n") - 1)}▮${textLine.slice(Math.max(0, prompt.cursor - cursorLine.lastIndexOf("\n") - 1))}`
+					: textLine;
+			void index;
+			lines.push(truncate(display, width));
+		}
+	}
+	if (controller.pendingAiPlan) {
+		lines.push("─".repeat(Math.max(0, width)));
+		lines.push(
+			truncate(
+				`AI staging plan (${controller.pendingAiPlan.plan.files.length} file(s)) — [y] apply [n] cancel:`,
+				width,
+			),
+		);
+		for (const entry of controller.pendingAiPlan.plan.files) {
+			const detail =
+				entry.hunks.length === 0
+					? "whole file"
+					: `hunks ${entry.hunks.map((hunk) => hunk + 1).join(", ")}`;
+			lines.push(truncate(`  ${entry.path} — ${detail}`, width));
+		}
 	}
 
 	// Commit composer panel (§72).
@@ -837,9 +1033,73 @@ export class GitTuiComponent implements Component {
 			this.tui.requestRender();
 			return;
 		}
+		// A produced plan takes over: y applies, n cancels (§70).
+		if (controller.pendingAiPlan) {
+			if (data === "y") {
+				controller.confirmAiPlan();
+			} else if (data === "n" || matchesKey(data, "escape")) {
+				controller.cancelAiPlan();
+			}
+			this.tui.requestRender();
+			return;
+		}
+		if (data === "a") {
+			controller.openAiPrompt();
+			this.tui.requestRender();
+			return;
+		}
+		// The AI prompt takes over the keyboard while it is open.
+		if (controller.aiPrompt) {
+			this.aiPromptInput(data);
+			return;
+		}
 		if (data === "q" || matchesKey(data, "escape")) {
 			this.onDone();
 			return;
+		}
+	}
+
+	/** Keyboard handling while the AI staging prompt is open. */
+	private aiPromptInput(data: string): void {
+		const controller = this.controller;
+		if (matchesKey(data, "escape")) {
+			controller.closeAiPrompt();
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "enter")) {
+			controller.planAiStageNow();
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "backspace")) {
+			controller.aiBackspace();
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "left")) {
+			controller.aiMove(-1);
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "right")) {
+			controller.aiMove(1);
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "up")) {
+			controller.aiMoveLine(-1);
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			controller.aiMoveLine(1);
+			this.tui.requestRender();
+			return;
+		}
+		if (data.length === 1 && data >= " ") {
+			controller.aiInsert(data);
+			this.tui.requestRender();
 		}
 	}
 
