@@ -82,11 +82,15 @@ function scriptedGit(output: string): GitRunner {
 	} as unknown as GitRunner;
 }
 
-function buildInvalidator(options: { remoteUrl?: string } = {}) {
+function buildInvalidator(
+	options: { remoteUrl?: string } = {},
+	githubEnabled: () => boolean = () => true,
+) {
 	const { cache, calls } = fakeCache();
 	const invalidator = createGhMutationInvalidator({
 		cache,
 		env: { GH_HOST: "github.com" },
+		githubEnabled,
 		git: scriptedGit(options.remoteUrl ?? "https://github.com/owner/repo"),
 		resolveCurrentRepo: async () => ({
 			host: "github.com",
@@ -151,6 +155,21 @@ describe("detectGhMutations", () => {
 });
 
 describe("shell gh mutation invalidation", () => {
+	it("skips cache invalidation while disabled and rechecks the live gate", async () => {
+		let enabled = false;
+		const { invalidator, calls } = buildInvalidator({}, () => enabled);
+		expect(await invalidator.observe("gh issue close 12 -R owner/repo")).toBe(
+			0,
+		);
+		expect(calls).toEqual([]);
+
+		enabled = true;
+		expect(await invalidator.observe("gh issue close 12 -R owner/repo")).toBe(
+			1,
+		);
+		expect(calls).toEqual(["issue-rows:github.com/owner/repo#12"]);
+	});
+
 	it("invalidates issue rows narrowly before a mutating command runs", async () => {
 		const { invalidator, calls } = buildInvalidator();
 		const count = await invalidator.observe("gh issue close 12");

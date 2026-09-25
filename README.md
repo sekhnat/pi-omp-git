@@ -51,7 +51,7 @@ For example, ask Pi: “Use `github` to search open bug issues in this repositor
 | `/git <revision>` | Inspect the files changed by a Git revision in a **read-only** TUI. |
 | `/commit [options]` | Plan and execute one or more agent-assisted Git commits. |
 | `/omp-git-doctor` | Display `git` and `gh` availability/authentication status. |
-
+| `/omp-git-doctor` | Display environment diagnostics: `git`/`gh` versions, availability, authentication status, configuration sources, and path checks. |
 `/git` is unavailable in Pi's print, JSON, or RPC modes. The TUI shows staged/unstaged/conflict sections and a side-by-side diff; binary and oversized files have limited previews. The same TUI is available from the companion CLI.
 
 | Key | In `/git` |
@@ -73,16 +73,17 @@ In revision mode, browsing/diff navigation still works, but working-tree mutatio
 ```text
 /commit --dry-run
 /commit
+/commit --all
 /commit --push
 /commit --no-changelog
 /commit --model provider/model-id
-/commit --context=release-notes
+/commit --context "release notes for 0.1.0"
 ```
 
-Supported flags: `--dry-run`, `--push`, `--no-changelog`, `--context <text>` (or `--context=<text>`), and `--model <model>` (or `--model=<model>`). The Pi command's argument parser splits on whitespace; use a single-token context or put longer background in the conversation. `--model` matches a model ID or `provider/id` in the current Pi model registry; otherwise it uses the session model.
+Supported flags: `--dry-run`, `--all`, `--push`, `--no-changelog`, `--context <text>` (or `--context=<text>`), and `--model <model>` (or `--model=<model>`). Both hosts share one strict parser: unknown flags, missing or invalid values, duplicate `--context`/`--model`, and bare positional arguments are errors — they are not silently ignored. Quoted multi-word contexts work (`--context "release notes"`); after `--`, the remaining words are treated as context. `--model` matches a model ID or `provider/id` in the current Pi model registry; otherwise it uses the session model.
 
 The pipeline examines the Git index, working tree, and recent commit subjects, proposes a plan, optionally updates an existing changelog, then executes the commits. If changes are already staged, it commits the planned staged set; **if nothing is staged but the tree is dirty, a non-dry-run invocation stages all changes (`git add -A .`) in compatibility mode**. Review the plan and your Git status before executing. Unresolved conflicts abort. A clean tree reports that no commit was created. A dry run does not stage, commit, edit the changelog, or push. `--push` pushes only after commits succeed (or can report/push existing commits on a clean tree); it is never implied by `/commit`.
-
+The pipeline examines the Git index, working tree, and recent commit subjects, proposes a plan, optionally updates an existing changelog, then executes the commits. **Commits operate on the staged set by default.** If nothing is staged but the tree is dirty, the command stops with an actionable no-staged-changes result — it stages, commits, and pushes nothing, even with `--push`. Pass `--all` to explicitly stage tracked modifications, deletions, and untracked files for this commit: the plan is prepared against a temporary copy of the index, and the real index is updated only after a valid proposal is approved. A dry run never stages, commits, edits the changelog, or push. Review the plan and your Git status before executing. Unresolved conflicts abort. A clean tree reports that no commit was created. `--push` pushes only after commits succeed (and can push existing commits on a clean tree); it is never implied by `/commit`.
 The agent may suggest a split plan. `commit.splitPolicy` controls handling: `confirm` (default) asks for interactive approval when multiple commits are proposed; `auto` executes the validated split; `never` collapses it to one commit. Without an interactive confirmation path, a split plan under `confirm` fails explicitly rather than silently proceeding. Changelog integration applies only when a changelog is found and enabled.
 
 ## Read GitHub resources through `read`
@@ -188,17 +189,18 @@ The standalone entry point is `bin/pi-omp-git.mjs`. After installing this checko
 
 ```sh
 node ./bin/pi-omp-git.mjs --help
+node ./bin/pi-omp-git.mjs doctor
 node ./bin/pi-omp-git.mjs git -C /path/to/repository
 node ./bin/pi-omp-git.mjs git HEAD~1 -C /path/to/repository
 node ./bin/pi-omp-git.mjs commit --dry-run -C /path/to/repository
+node ./bin/pi-omp-git.mjs commit --all --push -C /path/to/repository
 node ./bin/pi-omp-git.mjs commit --model provider/model-id --context "prepare release" -C /path/to/repository
 ```
 
-Run these `node ./bin/...` examples from this repository's root. `git [revision] [-C <dir>]` requires a terminal with TTY input **and** output; revision mode is read-only. `commit [--push] [--dry-run] [--no-changelog] [--context <text>] [--model <model>] [-C <dir>]` uses the same pipeline as `/commit` but a standalone model registry; it does not inherit the current Pi session model. The companion command reads the **user** config only (`projectTrusted: false`). Its default `commit.splitPolicy` is `confirm`, so a multi-commit proposal needs `auto` or `never` in user config: the CLI has no interactive split-confirmation callback. Successful commits, dry runs, and a definitive clean-tree result return exit code 0; failures return 1.
-
+Run these `node ./bin/...` examples from this repository's root. `git [revision] [-C <dir>]` requires a terminal with TTY input **and** output; revision mode is read-only. `doctor` prints local environment diagnostics (tool versions, Git/`gh` availability and authentication, configuration sources, and path writability) without a Pi session; credential material is redacted. `commit [--all] [--push] [--dry-run] [--no-changelog] [--context <text>] [--model <model>] [-C <dir>]` uses the same pipeline and shared strict argument parser as `/commit` but a standalone model registry; it does not inherit the current Pi session model. The companion command reads the **user** config only (`projectTrusted: false`). Its default `commit.splitPolicy` is `confirm`, so a multi-commit proposal needs `auto` or `never` in user config: the CLI has no interactive split-confirmation callback. Successful commits, dry runs, no-staged-changes guidance, and a definitive clean-tree result return exit code 0; failures return 1.
 ## Configuration
 
-The extension reads JSON from `~/.pi/agent/pi-omp-git.json` and, after Pi trusts the project, `<project>/.pi/pi-omp-git.json`. The current implementation checks **user-file values before project-file values for each key**: a valid user value wins; the trusted project file supplies keys missing/invalid in the user file. This differs from the source comment describing project-over-user precedence. The standalone CLI ignores the project file. Invalid or unrecognized values fall back to the next valid value/default, and missing or invalid JSON does not crash the extension. Configuration is resolved when used, so check a new command/operation after changing it.
+The extension reads JSON from `<agent dir>/pi-omp-git.json` and, after Pi trusts the project, `<project>/.pi/pi-omp-git.json`. Resolution order is **later layer wins per key**: built-in defaults ← user file ← trusted project file ← environment overrides. Only well-typed values are applied — an invalid or unknown key falls back to the value of the layer below it, and an unparseable file is ignored entirely. The project file is never read before Pi grants project trust. The standalone CLI resolves the user file only (it never reads project configuration). Configuration is resolved when used, so check a new command/operation after changing it.
 
 Example **user** configuration (adjust to your workflow):
 
@@ -224,24 +226,24 @@ Example **user** configuration (adjust to your workflow):
 |---|---|---|
 | `github.cache.enabled` | `true` | Enable eligible issue, PR, and PR-diff caching. |
 | `github.cache.softTtlSec` / `hardTtlSec` | `300` / `604800` | Fresh/maximum cache ages in seconds; effective hard TTL is at least soft TTL. |
-| `worktree.root` | `~/.pi/agent/worktrees` | Root for managed PR worktrees. |
+| `worktree.root` | `<agent dir>/worktrees` | Root for managed PR worktrees. |
 | `commit.splitPolicy` | `confirm` | `confirm`, `auto`, or `never` for multi-commit proposals. |
 | `commit.analyzeFilesEnabled` | `true` | Enable per-file agent analysis. |
 | `commit.analyzeFilesMaxFiles` / `analyzeFilesMaxConcurrency` | `8` / `4` | Cap per-file analysis count/concurrency. |
 | `commit.changelog` / `changelogMaxDiffChars` | `true` / `2000` | Integrate with a discovered changelog, with bounded diff context. |
 | `commit.dryRunAnalyzeFiles` | `false` | Allow per-file agent analysis during dry runs (may cost model calls). |
 
-`github.enabled` is accepted by the configuration loader, but **the current extension does not consult it to disable GitHub tools or reads**. To avoid GitHub requests, do not invoke those features; do not rely on `github.enabled: false` as a feature gate.
+`github.enabled: false` disables GitHub integration at both the registration and execution boundaries: the `github` tool is not advertised, tool calls and virtual `issue://`/`pr://` reads report `GitHub integration is disabled by configuration.`, model-facing guidance and shell-mutation observers are suppressed, and cache construction stays deferred. Git-only features (`/git`, `/commit` without `--push`) keep working. The gate is re-evaluated per operation, so config edits take effect without restarting the session.
 
 | Environment variable | Effect |
 |---|---|
-| `PI_OMP_GITHUB_CACHE_DB` | Override SQLite database path (`OMP_GITHUB_CACHE_DB` is a fallback alias). Default: `~/.pi/agent/cache/pi-omp-git/github-cache.db`. |
+| `PI_OMP_GITHUB_CACHE_DB` | Override SQLite database path (`OMP_GITHUB_CACHE_DB` is a fallback alias). Default: `<agent dir>/cache/pi-omp-git/github-cache.db`. |
 | `PI_OMP_GIT_WORKTREE_DIR` | Override worktree root (`OMP_WORKTREE_DIR` is a fallback alias); takes precedence over JSON `worktree.root`. |
 | `GH_HOST` | Default GitHub host when an explicit host is not supplied. |
 | `GH_TOKEN`, `GITHUB_TOKEN`, enterprise token variables, `GH_CONFIG_DIR` | Credential/config material used to isolate cached content by credential fingerprint, alongside `gh` authentication. |
 
 The package constructs its agent directory from the home directory (`~/.pi/agent`) rather than reading Pi's optional custom agent-directory setting. Log artifacts default to `~/.pi/agent/artifacts/pi-omp-git`.
-
+The package resolves Pi-owned state under Pi's configured agent directory (honoring `PI_CODING_AGENT_DIR` where Pi supports it) rather than assuming `~/.pi/agent`. Log artifacts default to `<agent dir>/artifacts/pi-omp-git`, and the default cache and worktree roots live under the same directory.
 ### Cache and stored data
 
 The GitHub cache uses Node's built-in SQLite implementation and opens lazily. Fresh cached issue/PR/diff views are served directly. After the soft TTL, issues and PRs refresh synchronously (showing a warning and stale content if refresh fails); diffs can serve a stale copy while refreshing in the background. Beyond the hard TTL the entry is fetched anew. Missing credential fingerprint, disabled caching, or cache/database failures fall back to uncached reads. Listings and search are live. `gh` mutations detected through Pi's shell hooks invalidate affected cache data **before** shell execution; confirmed `pr_push` invalidates that PR afterward. Mutation detection is heuristic, so external changes can remain cached until refresh/expiry.
@@ -259,13 +261,13 @@ From the repository root:
 
 ```sh
 npm ci
-npm test
-npm run typecheck
-npm run lint
+npm run check
+npm run smoke:pack
 ```
 
-`npm test` runs Vitest; `typecheck` uses TypeScript without emitting files; `lint` uses Biome. The repository declares `@earendil-works/pi-coding-agent` and `typebox` as peer dependencies and requires Node.js 22.19+.
+`npm run check` is the canonical gate: TypeScript typecheck, Biome lint/format validation, and the full Vitest suite in one command. `npm run smoke:pack` packs the package and installs the tarball into an isolated fixture, verifying the CLI entrypoint, Pi extension loading, and declared peers. The repository declares `@earendil-works/pi-coding-agent`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-tui`, and `typebox` as peer dependencies and requires Node.js 22.19+.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and the documentation map.
 ## Troubleshooting
 
 | Symptom | What to check |
@@ -279,4 +281,4 @@ npm run lint
 
 ## License
 
-MIT (as declared in `package.json`).
+MIT — see [LICENSE](LICENSE).

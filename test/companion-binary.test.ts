@@ -7,9 +7,16 @@
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { parseCliArgs, USAGE } from "../src/cli.ts";
 
@@ -33,7 +40,6 @@ function run(
 		encoding: "utf8",
 		env: {
 			...process.env,
-			GIT_CONFIG_GLOBAL: "/dev/null",
 			...(options.env ?? {}),
 		},
 	});
@@ -49,7 +55,7 @@ function initRepo(): string {
 	tempDirs.push(path);
 	execFileSync("git", ["init", "-q", "--initial-branch=main", "."], {
 		cwd: path,
-		env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+		env: { ...process.env },
 	});
 	execFileSync("git", ["config", "user.email", "t@t"], { cwd: path });
 	execFileSync("git", ["config", "user.name", "t"], { cwd: path });
@@ -123,6 +129,36 @@ describe("binary surface", () => {
 		expect(result.stderr).toContain("Unknown revision: no-such-ref");
 	});
 
+	it("blocks push when GitHub is disabled while preserving Git-only commits", () => {
+		const repo = initRepo();
+		const agentDir = mkdtempSync(join(tmpdir(), "pi-omp-git-cli-agent-"));
+		tempDirs.push(agentDir);
+		writeFileSync(
+			join(agentDir, "pi-omp-git.json"),
+			JSON.stringify({ github: { enabled: false } }),
+		);
+		const fakeBin = join(agentDir, "bin");
+		mkdirSync(fakeBin);
+		const ghLog = join(agentDir, "gh-called");
+		const fakeGh = join(fakeBin, "gh");
+		writeFileSync(fakeGh, `#!/bin/sh\nprintf called >> "${ghLog}"\n`);
+		chmodSync(fakeGh, 0o755);
+		const env = {
+			PI_CODING_AGENT_DIR: agentDir,
+			PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
+		};
+
+		const push = run(["commit", "-C", repo, "--push"], { env });
+		expect(push.status).toBe(1);
+		expect(push.stderr).toContain("GitHub integration is disabled");
+		expect(existsSync(ghLog)).toBe(false);
+
+		const localCommit = run(["commit", "-C", repo], { env });
+		expect(localCommit.status).toBe(0);
+		expect(localCommit.stdout).toContain("Nothing to commit");
+		expect(existsSync(ghLog)).toBe(false);
+	});
+
 	it("returns a definitive no-changes outcome for a clean tree without a model", async () => {
 		const repo = initRepo();
 		const result = run(["commit"], { cwd: repo });
@@ -131,10 +167,12 @@ describe("binary surface", () => {
 	}, 60_000);
 
 	it("surfaces pipeline errors with a nonzero exit and no stack traces", async () => {
-		// A dirty tree requires the commit agent; without a usable model
-		// configuration the pipeline fails with its error message.
+		// A staged change requires the commit agent; without a usable model
+		// configuration the pipeline fails with its error message. (A dirty
+		// tree with nothing staged is guidance, not an error.)
 		const repo = initRepo();
 		writeFileSync(join(repo, "a.txt"), "change\n");
+		execFileSync("git", ["add", "a.txt"], { cwd: repo, stdio: "ignore" });
 		const result = run(["commit", "--dry-run"], { cwd: repo });
 		expect(result.status).toBe(1);
 		expect(result.stderr).not.toMatch(/at \S+ \(/); // no stack frames

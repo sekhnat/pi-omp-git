@@ -1,41 +1,64 @@
 {
-  "name": "pi-omp-git",
-  "version": "0.0.1",
-  "description": "OMP Git/GitHub parity package for upstream Pi",
-  "type": "module",
-  "keywords": [
-    "pi-package"
-  ],
-  "license": "MIT",
-  "engines": {
-    "node": ">=22.19"
-  },
-  "pi": {
-    "extensions": [
-      "./src/index.ts"
-    ]
-  },
-  "scripts": {
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit",
-    "lint": "biome check ."
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "2",
-    "@types/node": "^26.1.2",
-    "typescript": "^5.9.0",
-    "vitest": "^4.1.11"
-  },
-  "bin": {
-    "pi-omp-git": "./bin/pi-omp-git.mjs"
-  },
-  "files": [
-    "bin/",
-    "src/",
-    "README.md"
-  ]
+	"name": "pi-omp-git",
+	"version": "0.1.0",
+	"description": "OMP Git/GitHub parity package for upstream Pi",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/sekhnat/pi-omp-git.git"
+	},
+	"bugs": {
+		"url": "https://github.com/sekhnat/pi-omp-git/issues"
+	},
+	"homepage": "https://github.com/sekhnat/pi-omp-git#readme",
+	"type": "module",
+	"keywords": [
+		"pi-package"
+	],
+	"license": "MIT",
+	"engines": {
+		"node": ">=22.19"
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"check": "npm run typecheck && npm run lint && npm run test",
+		"pretest": "npm run build",
+		"test": "vitest run",
+		"typecheck": "tsc --noEmit",
+		"lint": "biome check .",
+		"prepack": "npm run build",
+		"smoke:pack": "node scripts/smoke-pack.mjs"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2",
+		"@earendil-works/pi-agent-core": "0.87.1",
+		"@earendil-works/pi-coding-agent": "0.87.1",
+		"@earendil-works/pi-tui": "0.87.1",
+		"@types/node": "^26.1.2",
+		"typebox": "1.3.27",
+		"typescript": "^5.9.0",
+		"vitest": "^4.1.11"
+	},
+	"bin": {
+		"pi-omp-git": "./bin/pi-omp-git.mjs"
+	},
+	"files": [
+		"bin/",
+		"dist/",
+		"src/",
+		"README.md",
+		"LICENSE",
+		"SECURITY.md",
+		"CHANGELOG.md"
+	]
 }

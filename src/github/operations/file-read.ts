@@ -13,6 +13,7 @@
  * images and binaries degrade to metadata plus the source URL.
  */
 
+import { type Static, Type } from "typebox";
 import type { GitRunner } from "../../git/runner.ts";
 import {
 	AuthenticationError,
@@ -32,6 +33,7 @@ import {
 	resolveCurrentGithubRepo,
 } from "../repo.ts";
 import type { GhRunner } from "../runner.ts";
+import { optionalNonEmptyString } from "./params.ts";
 
 export interface FileReadTarget {
 	/** `owner/repo` or `host/owner/repo`; omitted → current checkout. */
@@ -40,6 +42,31 @@ export interface FileReadTarget {
 	branch?: string;
 	/** Repository-relative path (no leading slash, no traversal segments). */
 	path: string;
+}
+
+export const FILE_READ_OPERATION_PARAMETERS = Type.Object({
+	op: Type.Literal("file_read"),
+	repo: Type.Optional(Type.String()),
+	branch: Type.Optional(Type.String()),
+	path: Type.Optional(Type.String()),
+});
+
+export type FileReadOperationArguments = Static<
+	typeof FILE_READ_OPERATION_PARAMETERS
+>;
+
+export function validateFileReadOperationArguments(
+	params: Record<string, unknown>,
+): FileReadOperationArguments {
+	const repo = optionalNonEmptyString(params, "repo");
+	const branch = optionalNonEmptyString(params, "branch");
+	const path = optionalNonEmptyString(params, "path");
+	return {
+		op: "file_read",
+		...(repo !== undefined ? { repo } : {}),
+		...(branch !== undefined ? { branch } : {}),
+		...(path !== undefined ? { path } : {}),
+	};
 }
 
 /** The classification of one fetched file. */

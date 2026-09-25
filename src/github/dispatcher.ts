@@ -1,51 +1,37 @@
 /**
  * The `github` dispatcher tool — one model-callable operation surface for
  * the GitHub subsystem (docs/pi-omp-git-reference.md §18). The operation
- * enum is the stable dispatcher contract; `repo_view`, `file_read`, and
- * the five searches arrive with tickets 08-09, and later tickets fill in
- * the remaining operations with clear errors until they land.
+ * the stable tool schema is public. All operation groups use the typed registry,
+ * including run_watch streaming and artifact handling.
  *
  * Errors are thrown from `execute()` so Pi produces a failed tool result
  * from the message alone — no stack traces, no echoed tokens (§49).
  */
 
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
-import {
-	createMutationLock,
-	type RepositoryMutationLock,
-} from "../git/mutation-lock.ts";
+import type { RepositoryMutationLock } from "../git/mutation-lock.ts";
 import type { GitRunner } from "../git/runner.ts";
 import { PiOmpGitError } from "../shared/errors.ts";
 import type { Availability } from "./availability.ts";
 import type { GithubCache } from "./cache/cache.ts";
 import type { CheckoutRecord } from "./last-checkout.ts";
 import type { NestedModel, NestedSessionFactory } from "./nested-agent.ts";
-import { fetchFileRead } from "./operations/file-read.ts";
-import {
-	checkoutPullRequests,
-	type PrCheckoutFailure,
-	type PrCheckoutItem,
-	renderPrCheckout,
+import { GithubParamsError } from "./operations/params.ts";
+import type {
+	PrCheckoutFailure,
+	PrCheckoutItem,
 } from "./operations/pr-checkout.ts";
-import { createPullRequest } from "./operations/pr-create.ts";
-import { pushPullRequest } from "./operations/pr-push.ts";
-import { fetchRepoView, renderRepoView } from "./operations/repo-view.ts";
 import {
-	type RunWatchDetails,
-	type RunWatchRunState,
-	watchActions,
-} from "./operations/run-watch.ts";
-import {
-	fetchSearch,
-	parseSearchLimit,
-	type SearchOperation,
-} from "./operations/search.ts";
+	executeRegisteredOperation,
+	type GithubOperationContext,
+	validateRegisteredOperation,
+} from "./operations/registry.ts";
+import type { RunWatchRunState } from "./operations/run-watch.ts";
+import { SEARCH_OPERATION_NAMES } from "./operations/search.ts";
 import type { GhRunner } from "./runner.ts";
 
 /** The full §18 operation surface; later tickets activate the rest. */
@@ -90,14 +76,10 @@ type AssertSchemaOperationsMatch = SchemaOperations extends GithubOperation
 const _schemaOperationsMatch: AssertSchemaOperationsMatch = true;
 void _schemaOperationsMatch;
 
+export { GithubParamsError } from "./operations/params.ts";
+
 /** The operations served by the §34 search module. */
-export const SEARCH_OPERATIONS = [
-	"search_issues",
-	"search_prs",
-	"search_code",
-	"search_commits",
-	"search_repos",
-] as const;
+export const SEARCH_OPERATIONS = SEARCH_OPERATION_NAMES;
 
 export const GithubToolParams = Type.Object({
 	op: OPERATION_SCHEMA,
@@ -290,6 +272,8 @@ export interface GithubToolDeps {
 	git: GitRunner;
 	availability: Availability;
 	env: NodeJS.ProcessEnv;
+	/** Live feature gate checked before availability probes or operations. */
+	githubEnabled?: () => boolean;
 	/** Test seam for the nested agent session factory (§75). */
 	createNestedSession?: NestedSessionFactory;
 	/** Body-file directory override (tests inject a stable path). */
@@ -334,7 +318,6 @@ Operations:
 Use repo_view to orient in an unfamiliar repository, file_read instead of curl/wget for files stored in GitHub repositories, and the search_* operations instead of scraping pages. After pr_checkout, edit files under the returned worktree path using absolute paths.`;
 
 /** The dispatcher's own validation error for malformed tool parameters. */
-export class GithubParamsError extends PiOmpGitError {}
 
 /** Validate the dispatcher's operation enum and parameter shapes (§18). */
 export function validateGithubArguments(params: unknown): GithubToolArguments {
@@ -481,44 +464,10 @@ export function validateGithubArguments(params: unknown): GithubToolArguments {
 		}
 		validated[field] = value;
 	}
-	if (
-		SEARCH_OPERATIONS.includes(
-			operation as (typeof SEARCH_OPERATIONS)[number],
-		) &&
-		(!validated.query || validated.query.trim() === "")
-	) {
-		throw new GithubParamsError(
-			`The \`${operation}\` operation requires a non-empty \`query\` parameter.`,
-		);
-	}
-	// §24: pr_checkout requires `pr` (single or batch array).
-	if (operation === "pr_checkout" && validated.pr === undefined) {
-		throw new GithubParamsError(
-			"The `pr_checkout` operation requires the `pr` parameter — a PR number as a string, a PR URL, or a branch-like identifier.",
-		);
-	}
-	// §110: pr_push and run_watch accept a single PR; arrays are
-	// pr_checkout batching alone.
-	if (
-		(operation === "pr_push" || operation === "run_watch") &&
-		Array.isArray(validated.pr)
-	) {
-		throw new GithubParamsError(
-			`${operation} accepts a single PR; the array form of \`pr\` is valid for pr_checkout batching only.`,
-		);
-	}
-	// §40: run mode and commit mode are mutually exclusive.
-	if (
-		operation === "run_watch" &&
-		typeof validated.run === "string" &&
-		(typeof validated.commit === "string" || typeof validated.pr === "string")
-	) {
-		throw new GithubParamsError(
-			"run_watch accepts either `run` (run mode) or `commit`/`pr` (commit mode), not both.",
-		);
-	}
+	const operationArguments = validateRegisteredOperation(operation, record);
+	if (operationArguments) Object.assign(validated, operationArguments);
 	// §44: the log tail is a bounded line count.
-	if (validated.tail !== undefined) {
+	if (operation !== "run_watch" && validated.tail !== undefined) {
 		const tail = validated.tail;
 		if (typeof tail !== "number" || !Number.isFinite(tail) || tail <= 0) {
 			throw new GithubParamsError(
@@ -544,258 +493,33 @@ export async function executeGithubOperation(
 	// Dependency gating: the friendly unavailability/authentication errors
 	// come from the memoized probe, not a raw spawn failure (§4, §49).
 	await deps.availability.ensureGh();
-	switch (params.op) {
-		case "repo_view": {
-			const view = await fetchRepoView(
-				deps.gh,
-				{ repo: params.repo, branch: params.branch },
-				signal,
-			);
-			return {
-				content: [{ type: "text", text: renderRepoView(view, params.branch) }],
-				details: {
-					op: "repo_view",
-					repo: params.repo ?? view.nameWithOwner,
-					branch: params.branch,
-				},
-			};
-		}
-		case "file_read": {
-			const result = await fetchFileRead(
-				deps,
-				{ repo: params.repo, branch: params.branch, path: params.path ?? "" },
-				signal,
-			);
-			const details: GithubToolDetails = {
-				op: "file_read",
-				repo: params.repo,
-				branch: params.branch,
-				path: params.path,
-				kind: result.kind,
-			};
-			if (result.kind === "image" && result.image) {
-				return {
-					content: [
-						{
-							type: "image",
-							data: result.image.data,
-							mimeType: result.image.mimeType,
-						},
-					],
-					details,
-				};
-			}
-			if (result.kind === "binary" && result.metadata) {
-				return {
-					content: [{ type: "text", text: result.metadata }],
-					details,
-				};
-			}
-			return {
-				content: [{ type: "text", text: result.text ?? "" }],
-				details: {
-					...details,
-					...(result.truncated ? { truncated: true } : {}),
-				},
-			};
-		}
-		case "pr_create": {
-			const created = await createPullRequest(
-				{
-					gh: deps.gh,
-					git: deps.git,
-					cwd: ctx?.cwd ?? process.cwd(),
-					model: ctx?.model,
-					createNestedSession: deps.createNestedSession,
-					tempDir: deps.tempDir,
-				},
-				{
-					repo: params.repo,
-					title: params.title,
-					body: params.body,
-					base: params.base,
-					head: params.head,
-					draft: params.draft,
-					fill: params.fill,
-					reviewer: params.reviewer,
-					assignee: params.assignee,
-					label: params.label,
-				},
-				signal,
-			);
-			return {
-				content: [{ type: "text", text: created.summary }],
-				details: {
-					op: "pr_create",
-					repo: params.repo,
-					url: created.url,
-					number: created.number,
-				},
-			};
-		}
-
-		case "pr_checkout": {
-			await deps.availability.ensureGit();
-			const outcome = await checkoutPullRequests(
-				{
-					gh: deps.gh,
-					git: deps.git,
-					env: deps.env,
-					cwd: ctx?.cwd,
-					getWorktreeRoot:
-						deps.getWorktreeRoot ??
-						(() => join(homedir(), ".pi", "agent", "worktrees")),
-					mutationLock: deps.mutationLock ?? createMutationLock(),
-				},
-				{
-					pr: params.pr ?? "",
-					force: params.force,
-					repo: params.repo,
-				},
-				signal,
-			);
-			const single = outcome.checkouts[0];
-			return {
-				content: [{ type: "text", text: renderPrCheckout(outcome) }],
-				details: {
-					op: "pr_checkout",
-					repo: params.repo,
-					...(single
-						? {
-								number: single.number,
-								url: single.url,
-								prBranch: single.branch,
-								worktreePath: single.worktreePath,
-								reused: single.reused,
-							}
-						: {}),
-					checkouts: outcome.checkouts,
-					failures: outcome.failures,
-				},
-			};
-		}
-
-		case "pr_push": {
-			await deps.availability.ensureGit();
-			const pushed = await pushPullRequest(
-				{
-					gh: deps.gh,
-					git: deps.git,
-					cwd: ctx?.cwd,
-					cache: deps.cache,
-					getLastCheckout: ctx?.getLastCheckout,
-				},
-				{
-					pr: typeof params.pr === "string" ? params.pr : undefined,
-					branch: params.branch,
-					forceWithLease: params.forceWithLease,
-				},
-				signal,
-			);
-			return {
-				content: [{ type: "text", text: pushed.summary }],
-				details: {
-					op: "pr_push",
-					branch: pushed.branch,
-					url: pushed.url,
-					number: pushed.number,
-					resolvedBy: pushed.resolvedBy,
-					pushRemote: pushed.pushRemote,
-				},
-			};
-		}
-
-		case "run_watch": {
-			const watch = await watchActions(
-				{
-					gh: deps.gh,
-					git: deps.git,
-					env: deps.env,
-					cwd: ctx?.cwd ?? process.cwd(),
-					getLastCheckout: ctx?.getLastCheckout,
-					artifactsDir: deps.getArtifactsRoot?.(),
-					clock: deps.clock,
-					signal,
-					onUpdate: (update: RunWatchDetails) => {
-						onUpdate?.({
-							content: [],
-							details: {
-								op: "run_watch",
-								repo: update.repo,
-								...(update.run !== undefined ? { runId: update.run } : {}),
-								...(update.commit !== undefined
-									? { commitSha: update.commit }
-									: {}),
-								...(update.status !== undefined
-									? { status: update.status }
-									: {}),
-								...(update.elapsedSeconds !== undefined
-									? { elapsedSeconds: update.elapsedSeconds }
-									: {}),
-								...(update.runs !== undefined ? { runs: update.runs } : {}),
-							},
-						});
-					},
-				},
-				{
-					run: params.run,
-					commit: params.commit,
-					pr: typeof params.pr === "string" ? params.pr : undefined,
-					repo: params.repo,
-					tail: params.tail,
-				},
-			);
-			const watchDetails: GithubToolDetails = {
-				op: "run_watch",
-				repo: watch.details.repo,
-				...(watch.details.run !== undefined
-					? { runId: watch.details.run }
-					: {}),
-				...(watch.details.commit !== undefined
-					? { commitSha: watch.details.commit }
-					: {}),
-				outcome: watch.details.outcome,
-				elapsedSeconds: watch.details.elapsedSeconds,
-				runs: watch.details.runs,
-			};
-			return {
-				content: [{ type: "text", text: watch.text }],
-				details: watchDetails,
-			};
-		}
-
-		default: {
-			if (!(SEARCH_OPERATIONS as readonly string[]).includes(params.op)) {
-				throw new GithubParamsError(
-					`github operation "${params.op}" is not available in this build of pi-omp-git yet.`,
-				);
-			}
-			// search_*: GitHub query syntax reaches the API unaltered (§34).
-			const run = await fetchSearch(
-				deps,
-				params.op as SearchOperation,
-				{
-					repo: params.repo,
-					query: params.query ?? "",
-					since: params.since,
-					until: params.until,
-					dateField: params.dateField,
-					limit: params.limit,
-				},
-				signal,
-			);
-			return {
-				content: [{ type: "text", text: run.rendered }],
-				details: {
-					op: params.op,
-					repo: run.scope,
-					query: run.finalQuery,
-					limit: parseSearchLimit(params.limit),
-					total: run.totalCount,
-				},
-			};
-		}
-	}
+	const operationContext: GithubOperationContext = {
+		gh: deps.gh,
+		git: deps.git,
+		env: deps.env,
+		availability: deps.availability,
+		cwd: ctx?.cwd,
+		model: ctx?.model,
+		createNestedSession: deps.createNestedSession,
+		tempDir: deps.tempDir,
+		cache: deps.cache,
+		getWorktreeRoot: deps.getWorktreeRoot,
+		getArtifactsRoot: deps.getArtifactsRoot,
+		clock: deps.clock,
+		getLastCheckout: ctx?.getLastCheckout,
+		mutationLock: deps.mutationLock,
+	};
+	const registered = await executeRegisteredOperation(
+		params.op,
+		operationContext,
+		params,
+		signal,
+		onUpdate,
+	);
+	if (registered) return registered;
+	throw new GithubParamsError(
+		`github operation "${params.op}" is not available in this build of pi-omp-git yet.`,
+	);
 }
 
 /** Build the `github` dispatcher tool for registration with Pi. */
@@ -806,6 +530,11 @@ export function createGithubTool(deps: GithubToolDeps): GithubTool {
 		description: TOOL_DESCRIPTION,
 		parameters: GithubToolParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			if (deps.githubEnabled && !deps.githubEnabled()) {
+				throw new PiOmpGitError(
+					"GitHub integration is disabled by configuration.",
+				);
+			}
 			const validated = validateGithubArguments(params);
 			return executeGithubOperation(deps, validated, signal, ctx, onUpdate);
 		},

@@ -12,6 +12,7 @@
  * render agent-useful fields with canonical URLs (§39), never raw JSON.
  */
 
+import { type Static, Type } from "typebox";
 import type { GitRunner } from "../../git/runner.ts";
 import {
 	AuthenticationError,
@@ -32,14 +33,88 @@ import {
 } from "../repo.ts";
 import type { GhRunner } from "../runner.ts";
 import { sanitizeStderr } from "./file-read.ts";
+import { GithubParamsError, optionalNonEmptyString } from "./params.ts";
 
 /** The search operations served by this module. */
-export type SearchOperation =
-	| "search_issues"
-	| "search_prs"
-	| "search_code"
-	| "search_commits"
-	| "search_repos";
+export const SEARCH_OPERATION_NAMES = [
+	"search_issues",
+	"search_prs",
+	"search_code",
+	"search_commits",
+	"search_repos",
+] as const;
+
+export type SearchOperation = (typeof SEARCH_OPERATION_NAMES)[number];
+
+export function searchOperationParameters<Operation extends SearchOperation>(
+	operation: Operation,
+) {
+	return Type.Object({
+		op: Type.Literal(operation),
+		repo: Type.Optional(Type.String()),
+		query: Type.String({ minLength: 1 }),
+		since: Type.Optional(Type.String()),
+		until: Type.Optional(Type.String()),
+		dateField: Type.Optional(
+			Type.Union([Type.Literal("created"), Type.Literal("updated")]),
+		),
+		limit: Type.Optional(Type.Number()),
+	});
+}
+
+export type SearchOperationArguments<Operation extends SearchOperation> = Omit<
+	Static<ReturnType<typeof searchOperationParameters>>,
+	"op"
+> & { op: Operation };
+
+export function validateSearchOperationArguments<
+	Operation extends SearchOperation,
+>(
+	operation: Operation,
+	params: Record<string, unknown>,
+): SearchOperationArguments<Operation> {
+	const repo = optionalNonEmptyString(params, "repo");
+	const query = optionalNonEmptyString(params, "query");
+	if (query === undefined) {
+		throw new GithubParamsError(
+			`The \`${operation}\` operation requires a non-empty \`query\` parameter.`,
+		);
+	}
+	const since = optionalNonEmptyString(params, "since");
+	const until = optionalNonEmptyString(params, "until");
+	const rawDateField = params.dateField;
+	if (
+		rawDateField !== undefined &&
+		rawDateField !== null &&
+		rawDateField !== "created" &&
+		rawDateField !== "updated"
+	) {
+		throw new GithubParamsError(
+			'The `dateField` parameter must be "created" or "updated".',
+		);
+	}
+	const rawLimit = params.limit;
+	if (
+		rawLimit !== undefined &&
+		rawLimit !== null &&
+		typeof rawLimit !== "number"
+	) {
+		throw new GithubParamsError(
+			"The `limit` parameter must be a number between 1 and 50.",
+		);
+	}
+	return {
+		op: operation,
+		...(repo !== undefined ? { repo } : {}),
+		query,
+		...(since !== undefined ? { since } : {}),
+		...(until !== undefined ? { until } : {}),
+		...(rawDateField !== undefined && rawDateField !== null
+			? { dateField: rawDateField }
+			: {}),
+		...(typeof rawLimit === "number" ? { limit: rawLimit } : {}),
+	};
+}
 
 export interface SearchTarget {
 	/** `owner/repo` or `host/owner/repo`; ignored by `search_repos` (§36). */

@@ -7,7 +7,7 @@
  * seam, and the cache is a real SQLite database on a temporary path.
  */
 
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createReadTool } from "@earendil-works/pi-coding-agent";
@@ -98,6 +98,7 @@ interface BuildDepsOptions {
 	hardTtlSec?: number;
 	now?: () => number;
 	authToken?: string;
+	githubEnabled?: boolean;
 }
 
 function buildDeps(
@@ -105,6 +106,7 @@ function buildDeps(
 	options: BuildDepsOptions = {},
 ) {
 	const fixtures = { ...baseFixtures(), ...fixtureOverrides };
+	let githubEnabled = options.githubEnabled ?? true;
 	const calls: CapturedCall[] = [];
 	const exec: Exec = async (spec) => {
 		calls.push({ command: spec.command, args: [...spec.args], env: spec.env });
@@ -155,22 +157,31 @@ function buildDeps(
 		availability,
 		cache,
 		env,
-		getConfig: () =>
-			loadConfig({
+		getConfig: () => {
+			const config = loadConfig({
 				agentDir: cacheDir,
 				cwd: cacheDir,
 				env,
 				projectTrusted: false,
-			}),
+			});
+			return {
+				...config,
+				github: { ...config.github, enabled: githubEnabled },
+			};
+		},
 		nativeRead,
 	});
 	return {
 		override,
 		availability,
 		calls,
+		dbPath,
 		fixtures,
 		nativeRead,
 		env,
+		setGithubEnabled: (enabled: boolean): void => {
+			githubEnabled = enabled;
+		},
 		setAuthToken: (token: string): void => {
 			env.GH_TOKEN = token;
 		},
@@ -187,6 +198,28 @@ const ghViewCallCount = (calls: CapturedCall[]): number =>
 	).length;
 
 describe("read issue://N rendering", () => {
+	it("blocks virtual reads before GitHub and cache work while disabled", async () => {
+		const { override, calls, dbPath, setGithubEnabled } = buildDeps(
+			{},
+			{
+				githubEnabled: false,
+			},
+		);
+		await expect(
+			readVirtual(override, { path: "issue://123" }),
+		).rejects.toThrow(/GitHub integration is disabled/i);
+		expect(calls).toHaveLength(0);
+		expect(existsSync(dbPath)).toBe(false);
+
+		setGithubEnabled(true);
+		const result = await readVirtual(override, { path: "issue://123" });
+		const text =
+			result.content[0]?.type === "text" ? result.content[0].text : "";
+		expect(text).toContain("# 123 Bug: crash on save");
+		expect(ghViewCallCount(calls)).toBe(1);
+		expect(existsSync(dbPath)).toBe(true);
+	});
+
 	it("renders the complete issue with all sections", async () => {
 		const { override } = buildDeps();
 		const result = await readVirtual(override, { path: "issue://123" });
@@ -311,13 +344,15 @@ describe("read override delegation (zero behavior change)", () => {
 			availability,
 			cache,
 			env,
-			getConfig: () =>
-				loadConfig({
+			getConfig: () => {
+				const config = loadConfig({
 					agentDir: cacheDir,
 					cwd: cacheDir,
 					env,
 					projectTrusted: false,
-				}),
+				});
+				return { ...config, github: { ...config.github, enabled: false } };
+			},
 			nativeRead,
 		});
 

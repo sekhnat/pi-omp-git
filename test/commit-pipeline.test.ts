@@ -34,7 +34,7 @@ function git(args: string[], cwd: string): string {
 	return execFileSync("git", args, {
 		cwd,
 		encoding: "utf8",
-		env: { ...process.env, LC_ALL: "C", GIT_CONFIG_GLOBAL: "/dev/null" },
+		env: { ...process.env, LC_ALL: "C" },
 	});
 }
 
@@ -153,30 +153,79 @@ describe("single proposal execution (§77, §83)", () => {
 		expect(git(["status", "--porcelain=v2"], repo.path).trim()).toBe("");
 	});
 
-	it("uses compatibility staging for unstaged-only changes and reports it", async () => {
+	it("returns a no-staged-changes outcome for unstaged-only work", async () => {
+		const repo = initRepo();
+		writeFileSync(join(repo.path, "base.txt"), "1\n2\nunstaged\n");
+		const headBefore = git(["rev-parse", "HEAD"], repo.path).trim();
+		const indexBefore = git(["write-tree"], repo.path).trim();
+		const { run } = pipeline(repo, [propose(["a.txt"])], {
+			settings: settingsFor({ splitPolicy: "auto" }),
+		});
+		const result = await run({ push: true });
+		expect(result.outcome).toBe("no-staged-changes");
+		expect(result.text).toMatch(/--all/);
+		// HEAD/index invariance: nothing staged, nothing committed.
+		expect(git(["rev-parse", "HEAD"], repo.path).trim()).toBe(headBefore);
+		expect(git(["write-tree"], repo.path).trim()).toBe(indexBefore);
+		expect(git(["status", "--porcelain=v2"], repo.path)).toMatch(/^1 \.M /m);
+		// No unintended push: even --push must not push without staged changes.
+		expect(result.push).toBeUndefined();
+	});
+
+	it("returns a no-staged-changes outcome when only untracked files exist", async () => {
+		const repo = initRepo();
+		writeFileSync(join(repo.path, "new.txt"), "fresh\n");
+		const headBefore = git(["rev-parse", "HEAD"], repo.path).trim();
+		const { run } = pipeline(repo, [propose(["new.txt"])], {
+			settings: settingsFor({ splitPolicy: "auto" }),
+		});
+		const result = await run();
+		expect(result.outcome).toBe("no-staged-changes");
+		expect(result.text).toMatch(/--all/);
+		expect(git(["rev-parse", "HEAD"], repo.path).trim()).toBe(headBefore);
+		expect(git(["status", "--porcelain=v2"], repo.path)).toMatch(
+			/^\? new\.txt$/m,
+		);
+		// The untracked file was never staged.
+		expect(git(["ls-files", "--", "new.txt"], repo.path).trim()).toBe("");
+	});
+
+	it("commits only the staged set and leaves unrelated unstaged work alone", async () => {
 		const repo = initRepo();
 		writeFileSync(join(repo.path, "a.txt"), "change\n");
+		git(["add", "a.txt"], repo.path);
+		writeFileSync(join(repo.path, "base.txt"), "1\n2\nunrelated\n");
+		const headBefore = git(["rev-parse", "HEAD"], repo.path).trim();
 		const { run } = pipeline(repo, [propose(["a.txt"])], {
 			settings: settingsFor({ splitPolicy: "auto" }),
 		});
 		const result = await run();
 		expect(result.outcome).toBe("committed");
-		expect(result.usedCompatibilityStaging).toBe(true);
-		expect(result.text).toContain("compatibility mode");
-		expect(git(["status", "--porcelain=v2"], repo.path).trim()).toBe("");
+		expect(git(["rev-parse", "HEAD"], repo.path).trim()).not.toBe(headBefore);
+		const committed = git(
+			["show", "--name-only", "--format=", "HEAD"],
+			repo.path,
+		);
+		expect(committed).toContain("a.txt");
+		expect(committed).not.toContain("base.txt");
+		// The unrelated change is still there, still unstaged.
+		expect(git(["status", "--porcelain=v2"], repo.path)).toMatch(/^1 \.M /m);
 	});
 
-	it("includes untracked files via compatibility staging", async () => {
+	it("commits the staged content of a partially staged file and keeps the rest unstaged", async () => {
 		const repo = initRepo();
-		writeFileSync(join(repo.path, "new.txt"), "fresh\n");
-		const { run } = pipeline(repo, [propose(["new.txt"])], {
+		writeFileSync(join(repo.path, "base.txt"), "1\n2\n3\nstaged\n");
+		git(["add", "base.txt"], repo.path);
+		writeFileSync(join(repo.path, "base.txt"), "1\n2\n3\nstaged\nworktree\n");
+		const { run } = pipeline(repo, [propose(["base.txt"])], {
 			settings: settingsFor({ splitPolicy: "auto" }),
 		});
 		const result = await run();
 		expect(result.outcome).toBe("committed");
-		expect(
-			git(["show", "--name-only", "--format=", "HEAD"], repo.path),
-		).toContain("new.txt");
+		const headContent = git(["show", "HEAD:base.txt"], repo.path);
+		expect(headContent).toContain("staged");
+		expect(headContent).not.toContain("worktree");
+		expect(git(["status", "--porcelain=v2"], repo.path)).toMatch(/^1 \.M /m);
 	});
 
 	it("returns a definitive no-changes outcome on a clean tree", async () => {
@@ -223,34 +272,43 @@ describe("single proposal execution (§77, §83)", () => {
 });
 
 describe("dry run (§82, D1)", () => {
-	it("prints the full plan and mutates neither index nor working tree", async () => {
+	// The operating view for a dry run is the staged set (staged-only
+	// default); a dirty tree with nothing staged is guidance, not a plan.
+	it("prints the staged-only plan and mutates neither index nor working tree", async () => {
 		const repo = initRepo();
 		writeFileSync(join(repo.path, "a.txt"), "change\n");
+		git(["add", "a.txt"], repo.path);
 		const { run } = pipeline(repo, [propose(["a.txt"])]);
 		const result = await run({ dryRun: true });
 		expect(result.outcome).toBe("dry-run");
 		expect(result.plan).toContain("feat: do the thing");
 		expect(result.plan).toContain("- a.txt");
-		// Index untouched (D1): the change stays unstaged.
-		expect(git(["status", "--porcelain=v2"], repo.path)).toContain("? a.txt");
+		// Still staged, not committed: HEAD/index invariance.
+		expect(git(["status", "--porcelain=v2"], repo.path)).toMatch(/^1 [AM]\. /m);
 		expect(git(["stash", "list"], repo.path).trim()).toBe("");
 	});
 
-	it("performs compatibility analysis without staging in dry-run", async () => {
+	it("returns no-staged-changes guidance in dry-run when nothing is staged", async () => {
 		const repo = initRepo();
 		writeFileSync(join(repo.path, "brand-new.txt"), "fresh\n");
+		const headBefore = git(["rev-parse", "HEAD"], repo.path).trim();
+		const indexBefore = git(["write-tree"], repo.path).trim();
 		const { run } = pipeline(repo, [propose(["brand-new.txt"])]);
 		const result = await run({ dryRun: true });
-		expect(result.outcome).toBe("dry-run");
-		expect(result.plan).toContain("brand-new.txt");
-		expect(git(["status", "--porcelain=v2"], repo.path)).toContain(
-			"? brand-new.txt",
+		expect(result.outcome).toBe("no-staged-changes");
+		expect(result.text).toMatch(/--all/);
+		// Dry-run invariance: nothing staged, committed, or mutated.
+		expect(git(["rev-parse", "HEAD"], repo.path).trim()).toBe(headBefore);
+		expect(git(["write-tree"], repo.path).trim()).toBe(indexBefore);
+		expect(git(["status", "--porcelain=v2"], repo.path)).toMatch(
+			/^\? brand-new\.txt$/m,
 		);
 	});
 
 	it("never pushes in dry-run", async () => {
 		const repo = initRepo();
 		writeFileSync(join(repo.path, "a.txt"), "change\n");
+		git(["add", "a.txt"], repo.path);
 		const { run } = pipeline(repo, [propose(["a.txt"])]);
 		const result = await run({ dryRun: true, push: true });
 		expect(result.outcome).toBe("dry-run");
@@ -620,7 +678,7 @@ describe("--push (§86)", () => {
 		const bare = mkdtempSync(join(tmpdir(), "pi-omp-git-remote-"));
 		tempDirs.push(bare);
 		execFileSync("git", ["init", "-q", "--bare", bare], {
-			env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+			env: { ...process.env },
 		});
 		git(["remote", "add", "origin", bare], repo.path);
 		git(["push", "-q", "-u", "origin", "main"], repo.path);
@@ -630,6 +688,7 @@ describe("--push (§86)", () => {
 	it("pushes after commits succeed and never before", async () => {
 		const { repo } = withUpstream();
 		writeFileSync(join(repo.path, "a.txt"), "change\n");
+		git(["add", "a.txt"], repo.path);
 		const { run } = pipeline(repo, [propose(["a.txt"])], {
 			settings: settingsFor({ splitPolicy: "auto" }),
 		});
@@ -648,7 +707,7 @@ describe("--push (§86)", () => {
 		const diverge = mkdtempSync(join(tmpdir(), "pi-omp-git-diverge-"));
 		tempDirs.push(diverge);
 		execFileSync("git", ["init", "-q", diverge], {
-			env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+			env: { ...process.env },
 		});
 		git(["config", "user.email", "t@t"], diverge);
 		git(["config", "user.name", "t"], diverge);
@@ -659,6 +718,7 @@ describe("--push (§86)", () => {
 		// own push below must never force.
 		git(["push", "-q", "--force", bare, "HEAD:refs/heads/main"], diverge);
 		writeFileSync(join(repo.path, "a.txt"), "change\n");
+		git(["add", "a.txt"], repo.path);
 		const { run } = pipeline(repo, [propose(["a.txt"])], {
 			settings: settingsFor({ splitPolicy: "auto" }),
 		});
@@ -689,7 +749,7 @@ describe("--push (§86)", () => {
 		const bare = mkdtempSync(join(tmpdir(), "pi-omp-git-prremote-"));
 		tempDirs.push(bare);
 		execFileSync("git", ["init", "-q", "--bare", bare], {
-			env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+			env: { ...process.env },
 		});
 		git(["remote", "add", "origin", bare], repo.path);
 		// OMP checkout metadata marks this as a PR branch.
@@ -714,16 +774,244 @@ describe("--push (§86)", () => {
 	});
 });
 
+describe("--all explicit staging", () => {
+	it("stages and commits the full change set: staged, unstaged, and untracked", async () => {
+		const repo = initRepo();
+		writeFileSync(join(repo.path, "a.txt"), "staged new\n");
+		git(["add", "a.txt"], repo.path);
+		writeFileSync(join(repo.path, "base.txt"), "1\n2\nunstaged\n");
+		writeFileSync(join(repo.path, "new.txt"), "untracked\n");
+		const headBefore = git(["rev-parse", "HEAD"], repo.path).trim();
+		const { run } = pipeline(
+			repo,
+			[propose(["a.txt", "base.txt", "new.txt"])],
+			{ settings: settingsFor({ splitPolicy: "auto" }) },
+		);
+		const result = await run({ all: true });
+		expect(result.outcome).toBe("committed");
+		expect(git(["rev-parse", "HEAD"], repo.path).trim()).not.toBe(headBefore);
+		const committed = git(
+			["show", "--name-only", "--format=", "HEAD"],
+			repo.path,
+		);
+		expect(committed).toContain("a.txt");
+		expect(committed).toContain("base.txt");
+		expect(committed).toContain("new.txt");
+		expect(git(["status", "--porcelain=v2"], repo.path).trim()).toBe("");
+	});
+
+	it("stages deletions and untracked files with --all", async () => {
+		const repo = initRepo();
+		rmSync(join(repo.path, "base.txt"));
+		writeFileSync(join(repo.path, "new.txt"), "fresh\n");
+		const { run } = pipeline(repo, [propose(["base.txt", "new.txt"])], {
+			settings: settingsFor({ splitPolicy: "auto" }),
+		});
+		const result = await run({ all: true });
+		expect(result.outcome).toBe("committed");
+		const changes = git(
+			["show", "--name-status", "--format=", "HEAD"],
+			repo.path,
+		);
+		expect(changes).toContain("D\tbase.txt");
+		expect(changes).toContain("A\tnew.txt");
+		expect(git(["status", "--porcelain=v2"], repo.path).trim()).toBe("");
+	});
+
+	it("keeps the deterministic no-changes outcome for --all on a clean tree", async () => {
+		const repo = initRepo();
+		const { run } = pipeline(repo, [propose(["base.txt"])]);
+		const result = await run({ all: true });
+		expect(result.outcome).toBe("no-changes");
+		expect(result.text).toContain("Nothing to commit");
+	});
+
+	it("previews the complete all-changes plan without mutating HEAD, index, or worktree", async () => {
+		const repo = initRepo();
+		writeFileSync(join(repo.path, "a.txt"), "staged new\n");
+		git(["add", "a.txt"], repo.path);
+		writeFileSync(join(repo.path, "base.txt"), "1\n2\nunstaged\n");
+		writeFileSync(join(repo.path, "new.txt"), "untracked\n");
+		const headBefore = git(["rev-parse", "HEAD"], repo.path).trim();
+		const indexBefore = git(["write-tree"], repo.path).trim();
+		const statusBefore = git(["status", "--porcelain=v2"], repo.path);
+		const { run } = pipeline(repo, [propose(["a.txt", "base.txt", "new.txt"])]);
+		const result = await run({ dryRun: true, all: true });
+		expect(result.outcome).toBe("dry-run");
+		for (const path of ["a.txt", "base.txt", "new.txt"]) {
+			expect(result.plan).toContain(`- ${path}`);
+		}
+		expect(git(["rev-parse", "HEAD"], repo.path).trim()).toBe(headBefore);
+		expect(git(["write-tree"], repo.path).trim()).toBe(indexBefore);
+		expect(git(["status", "--porcelain=v2"], repo.path)).toBe(statusBefore);
+		expect(git(["stash", "list"], repo.path).trim()).toBe("");
+	});
+
+	it("includes untracked file contents in the all-changes preview diffs", async () => {
+		const repo = initRepo();
+		writeFileSync(join(repo.path, "brand-new.txt"), "untracked content\n");
+		const { deps, run } = pipeline(repo, [propose(["brand-new.txt"])]);
+		const originalFactory = deps.createNestedSession;
+		if (!originalFactory) throw new Error("factory missing");
+		const seen: string[] = [];
+		deps.createNestedSession = async (factoryOptions) => {
+			const session = await originalFactory(factoryOptions);
+			const tools = factoryOptions.customTools ?? [];
+			const diffTool = tools.find(
+				(candidate) => candidate.name === "git_file_diff",
+			);
+			if (!diffTool) throw new Error("git_file_diff missing");
+			const result = await diffTool.execute(
+				"id",
+				{ path: "brand-new.txt" } as never,
+				undefined,
+				undefined,
+				{} as never,
+			);
+			seen.push(
+				result.content
+					.map((part) => ("text" in part ? part.text : ""))
+					.join(""),
+			);
+			return session;
+		};
+		const result = await run({ dryRun: true, all: true });
+		expect(result.outcome).toBe("dry-run");
+		// The preview carries the untracked file's patch, not just its name.
+		expect(seen.join("")).toContain("+untracked content");
+		expect(git(["status", "--porcelain=v2"], repo.path)).toMatch(
+			/^\? brand-new\.txt$/m,
+		);
+	});
+
+	it("keeps the caller's index intact when the proposal is invalid with --all", async () => {
+		const repo = initRepo();
+		// Partially staged: staged content differs from the worktree.
+		writeFileSync(join(repo.path, "base.txt"), "1\n2\n3\nstaged\n");
+		git(["add", "base.txt"], repo.path);
+		writeFileSync(join(repo.path, "base.txt"), "1\n2\n3\nstaged\nworktree\n");
+		writeFileSync(join(repo.path, "a.txt"), "new\n");
+		const headBefore = git(["rev-parse", "HEAD"], repo.path).trim();
+		const indexBefore = git(["write-tree"], repo.path).trim();
+		const statusBefore = git(["status", "--porcelain=v2"], repo.path);
+		const { run } = pipeline(repo, [
+			{
+				tool: "propose_commit",
+				params: { type: "feat", summary: "x", files: ["ghost.txt"] },
+			},
+		]);
+		await expect(run({ all: true })).rejects.toThrow(/not part of the changes/);
+		// A failed proposal must not stage anything.
+		expect(git(["rev-parse", "HEAD"], repo.path).trim()).toBe(headBefore);
+		expect(git(["write-tree"], repo.path).trim()).toBe(indexBefore);
+		expect(git(["status", "--porcelain=v2"], repo.path)).toBe(statusBefore);
+	});
+
+	it("keeps the caller's index intact when the agent proposes nothing with --all", async () => {
+		const repo = initRepo();
+		writeFileSync(join(repo.path, "a.txt"), "change\n");
+		git(["add", "a.txt"], repo.path);
+		const indexBefore = git(["write-tree"], repo.path).trim();
+		const { run } = pipeline(repo, []);
+		await expect(run({ all: true })).rejects.toThrow(
+			/did not propose a commit plan/,
+		);
+		expect(git(["write-tree"], repo.path).trim()).toBe(indexBefore);
+		expect(git(["status", "--porcelain=v2"], repo.path)).toMatch(/^1 A\. /m);
+	});
+
+	it("aborts when the working tree changes between the plan and the real staging", async () => {
+		const repo = initRepo();
+		writeFileSync(join(repo.path, "a.txt"), "one\n");
+		git(["add", "a.txt"], repo.path);
+		writeFileSync(join(repo.path, "b.txt"), "two\n");
+		const headBefore = git(["rev-parse", "HEAD"], repo.path).trim();
+		const indexBefore = git(["write-tree"], repo.path).trim();
+		const { run } = pipeline(
+			repo,
+			[
+				proposeSplit([
+					{ type: "feat", summary: "first", files: ["a.txt"] },
+					{ type: "fix", summary: "second", files: ["b.txt"] },
+				]),
+			],
+			{ settings: settingsFor({ splitPolicy: "confirm" }) },
+		);
+		await expect(
+			run({
+				all: true,
+				confirmPlan: async () => {
+					// Concurrent worktree modification after the plan was made.
+					writeFileSync(join(repo.path, "b.txt"), "two\nchanged\n");
+					return true;
+				},
+			}),
+		).rejects.toThrow(
+			/working tree changed while the commit was being planned/,
+		);
+		// Nothing was staged or committed.
+		expect(git(["rev-parse", "HEAD"], repo.path).trim()).toBe(headBefore);
+		expect(git(["write-tree"], repo.path).trim()).toBe(indexBefore);
+		const status = git(["status", "--porcelain=v2"], repo.path);
+		expect(status).toMatch(/^1 A\. /m);
+		expect(status).toMatch(/^\? b\.txt$/m);
+	});
+
+	it("aborts when the index changes between the plan and the real staging", async () => {
+		const repo = initRepo();
+		writeFileSync(join(repo.path, "a.txt"), "one\n");
+		git(["add", "a.txt"], repo.path);
+		writeFileSync(join(repo.path, "c.txt"), "planned\n");
+		writeFileSync(join(repo.path, "e.txt"), "concurrent\n");
+		const headBefore = git(["rev-parse", "HEAD"], repo.path).trim();
+		const { run } = pipeline(
+			repo,
+			[
+				proposeSplit([
+					{ type: "feat", summary: "first", files: ["a.txt", "c.txt"] },
+					{ type: "fix", summary: "second", files: ["e.txt"] },
+				]),
+			],
+			{ settings: settingsFor({ splitPolicy: "confirm" }) },
+		);
+		await expect(
+			run({
+				all: true,
+				confirmPlan: async () => {
+					// Concurrent staging of an unplanned file after approval.
+					execFileSync("git", ["add", "c.txt"], {
+						cwd: repo.path,
+						stdio: "ignore",
+					});
+					return true;
+				},
+			}),
+		).rejects.toThrow(/index changed while the commit was being planned/);
+		expect(git(["rev-parse", "HEAD"], repo.path).trim()).toBe(headBefore);
+		const status = git(["status", "--porcelain=v2"], repo.path);
+		// Only the caller's own staging happened; the pipeline added nothing.
+		expect(status).toMatch(/^1 A\. /m);
+		expect(git(["ls-files", "--", "c.txt"], repo.path).trim()).not.toBe("");
+	});
+});
+
 describe("argument parsing (§73)", () => {
-	it("parses /commit flags", async () => {
+	it("parses /commit flags from raw input through the shared parser", async () => {
 		const { parseCommitArgs } = await import("../src/index.ts");
 		const parsed = parseCommitArgs(
-			"--dry-run --push --no-changelog --context release notes --model gpt-5",
+			`--dry-run --push --no-changelog --context "release notes" --model gpt-5`,
 		);
 		expect(parsed.dryRun).toBe(true);
 		expect(parsed.push).toBe(true);
 		expect(parsed.noChangelog).toBe(true);
-		expect(parsed.context).toBe("release");
+		expect(parsed.context).toBe("release notes");
 		expect(parsed.model).toBe("gpt-5");
+	});
+
+	it("rejects invalid input before the pipeline runs", async () => {
+		const { parseCommitArgs } = await import("../src/index.ts");
+		expect(() => parseCommitArgs("--unknown")).toThrow(/unknown/i);
+		expect(() => parseCommitArgs("release notes")).toThrow(/unexpected/i);
+		expect(() => parseCommitArgs("--model")).toThrow(/model/i);
 	});
 });

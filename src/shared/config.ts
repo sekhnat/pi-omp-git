@@ -10,7 +10,7 @@
  * ignored entirely. Configuration must never crash the extension.
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface CacheSettings {
@@ -88,6 +88,15 @@ export interface LoadConfigOptions {
 	projectTrusted: boolean;
 }
 
+export interface ConfigSourceInfo {
+	path: string;
+	discovered: boolean;
+	/** Whether this readable source is eligible to contribute settings. */
+	active: boolean;
+}
+
+export type ConfigLayerName = "defaults" | "user" | "project" | "environment";
+
 export interface ResolvedConfig extends OmpGitSettings {
 	/** Absolute path of the SQLite cache database after environment overrides. */
 	cacheDatabasePath: string;
@@ -95,6 +104,13 @@ export interface ResolvedConfig extends OmpGitSettings {
 	worktreeRoot: string;
 	/** Absolute root for captured log artifacts (§44). */
 	artifactsRoot: string;
+	/** Paths and eligibility of the user/project configuration sources. */
+	configSources: {
+		user: ConfigSourceInfo;
+		project: ConfigSourceInfo;
+	};
+	/** Resolution candidates from lowest to highest precedence. */
+	activeConfigLayers: ConfigLayerName[];
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -113,7 +129,13 @@ function pickSplitPolicy(
 	return undefined;
 }
 
-function readJsonFile(path: string): UnknownRecord {
+interface ReadConfigFile {
+	values: UnknownRecord;
+	discovered: boolean;
+	usable: boolean;
+}
+
+function readJsonFile(path: string): ReadConfigFile {
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
 		if (
@@ -121,12 +143,12 @@ function readJsonFile(path: string): UnknownRecord {
 			typeof parsed !== "object" ||
 			Array.isArray(parsed)
 		) {
-			return {};
+			return { values: {}, discovered: true, usable: false };
 		}
-		return parsed as UnknownRecord;
+		return { values: parsed as UnknownRecord, discovered: true, usable: true };
 	} catch {
 		// Missing or invalid configuration degrades to the next layer.
-		return {};
+		return { values: {}, discovered: existsSync(path), usable: false };
 	}
 }
 
@@ -201,13 +223,29 @@ function pickInteger(
 }
 
 export function loadConfig(options: LoadConfigOptions): ResolvedConfig {
-	const layers: UnknownRecord[] = [];
 	const userFile = join(options.agentDir, CONFIG_FILE_NAME);
-	layers.push(readJsonFile(userFile));
-	if (options.projectTrusted) {
-		const projectFile = join(options.cwd, ".pi", CONFIG_FILE_NAME);
-		layers.push(readJsonFile(projectFile));
-	}
+	const userConfig = readJsonFile(userFile);
+	const projectFile = join(options.cwd, ".pi", CONFIG_FILE_NAME);
+	// Discover untrusted project config paths for diagnostics, but never read or apply their contents.
+	const projectConfig = options.projectTrusted
+		? readJsonFile(projectFile)
+		: { values: {}, discovered: existsSync(projectFile), usable: false };
+	// Pickers stop at the first valid value, so inspect the highest-precedence file first.
+	const layers: UnknownRecord[] = [];
+	if (projectConfig.usable) layers.push(projectConfig.values);
+	if (userConfig.usable) layers.push(userConfig.values);
+	const configSources = {
+		user: {
+			path: userFile,
+			discovered: userConfig.discovered,
+			active: userConfig.usable,
+		},
+		project: {
+			path: projectFile,
+			discovered: projectConfig.discovered,
+			active: options.projectTrusted && projectConfig.usable,
+		},
+	};
 
 	const settings: OmpGitSettings = {
 		worktree: {
@@ -296,6 +334,15 @@ export function loadConfig(options: LoadConfigOptions): ResolvedConfig {
 		settings.worktree.root ??
 		join(options.agentDir, "worktrees");
 
+	const activeConfigLayers: ConfigLayerName[] = ["defaults"];
+	if (userConfig.usable) activeConfigLayers.push("user");
+	if (options.projectTrusted && projectConfig.usable) {
+		activeConfigLayers.push("project");
+	}
+	if (envPath !== undefined || envWorktreeRoot !== undefined) {
+		activeConfigLayers.push("environment");
+	}
+
 	const splitPolicy =
 		settings.commit.splitPolicy ?? COMMIT_DEFAULTS.splitPolicy;
 
@@ -314,5 +361,7 @@ export function loadConfig(options: LoadConfigOptions): ResolvedConfig {
 			join(options.agentDir, "cache", "pi-omp-git", "github-cache.db"),
 		worktreeRoot,
 		artifactsRoot: join(options.agentDir, "artifacts", "pi-omp-git"),
+		configSources,
+		activeConfigLayers,
 	};
 }

@@ -25,6 +25,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { type Static, Type } from "typebox";
 import type { RepositoryMutationLock } from "../../git/mutation-lock.ts";
 import type { GitRunner } from "../../git/runner.ts";
 import {
@@ -43,13 +44,16 @@ import {
 	CommandNotFoundError,
 	type RunResult,
 } from "../../shared/subprocess.ts";
-import {
-	checkPrUrlRepoConflict,
-	type PrIdentifier,
-	parsePrIdentifier,
-} from "../pr-ref.ts";
+import type { PrIdentifier } from "../pr-ref.ts";
 import { parseGitRemoteUrl, resolveCurrentGithubRepo } from "../repo.ts";
 import type { GhRunner } from "../runner.ts";
+import { GithubParamsError, optionalNonEmptyString } from "./params.ts";
+import {
+	planBaseIdentity,
+	planCheckoutTarget,
+	planPrCheckoutBatch,
+	planPrCheckoutRef,
+} from "./planning.ts";
 
 /** Worktree suffix attempts before the collision error (§27, bounded). */
 const MAX_WORKTREE_SUFFIXES = 100;
@@ -90,6 +94,66 @@ export interface PrCheckoutTarget {
 	pr: string | string[];
 	force?: boolean;
 	repo?: string;
+}
+
+export const PR_CHECKOUT_OPERATION_PARAMETERS = Type.Object({
+	op: Type.Literal("pr_checkout"),
+	pr: Type.Union([Type.String(), Type.Array(Type.String())]),
+	force: Type.Optional(Type.Boolean()),
+	repo: Type.Optional(Type.String()),
+});
+
+export type PrCheckoutOperationArguments = Static<
+	typeof PR_CHECKOUT_OPERATION_PARAMETERS
+>;
+
+export function validatePrCheckoutOperationArguments(
+	params: Record<string, unknown>,
+): PrCheckoutOperationArguments {
+	const rawPr = params.pr;
+	if (rawPr === undefined || rawPr === null) {
+		throw new GithubParamsError(
+			"The `pr_checkout` operation requires the `pr` parameter — a PR number as a string, a PR URL, or a branch-like identifier.",
+		);
+	}
+	let pr: string | string[];
+	if (typeof rawPr === "string") {
+		if (rawPr.trim() === "") {
+			throw new GithubParamsError(
+				"The `pr` parameter must be a non-empty string.",
+			);
+		}
+		pr = rawPr;
+	} else if (Array.isArray(rawPr)) {
+		if (rawPr.length === 0) {
+			throw new GithubParamsError("The `pr` array must not be empty.");
+		}
+		if (rawPr.some((item) => typeof item !== "string" || item.trim() === "")) {
+			throw new GithubParamsError(
+				"The `pr` array must contain non-empty strings.",
+			);
+		}
+		pr = rawPr as string[];
+	} else if (typeof rawPr === "number") {
+		throw new GithubParamsError(
+			"The `pr` parameter must be text — a PR number as a string, a PR URL, or a branch-like identifier. JSON numbers are rejected.",
+		);
+	} else {
+		throw new GithubParamsError(
+			"The `pr` parameter must be a string or an array of strings.",
+		);
+	}
+	const repo = optionalNonEmptyString(params, "repo");
+	const force = params.force;
+	if (force !== undefined && force !== null && typeof force !== "boolean") {
+		throw new GithubParamsError("The `force` parameter must be a boolean.");
+	}
+	return {
+		op: "pr_checkout",
+		pr,
+		...(repo !== undefined ? { repo } : {}),
+		...(typeof force === "boolean" ? { force } : {}),
+	};
 }
 
 export interface PrCheckoutItem {
@@ -513,13 +577,7 @@ async function checkoutOne(
 	target: PrCheckoutTarget,
 	signal: AbortSignal | undefined,
 ): Promise<PrCheckoutItem> {
-	const parsed = parsePrIdentifier(identifier);
-	if (!parsed) {
-		throw new PiOmpGitError(
-			`Invalid PR identifier: ${identifier}. Use a PR number as text, a PR URL, or a branch-like identifier.`,
-		);
-	}
-	checkPrUrlRepoConflict(parsed, target.repo);
+	const parsed = planPrCheckoutRef(identifier, target.repo);
 
 	const { payload, headRefOidProvided } = await fetchPrPayload(
 		deps,
@@ -528,62 +586,49 @@ async function checkoutOne(
 		signal,
 	);
 
-	const headRefName = payload.headRefName ?? `pull/${payload.number}/head`;
 	const baseIdentity = await resolveBaseIdentity(
 		deps,
 		parsed,
 		target.repo,
 		signal,
 	);
-	const pullUrl =
-		payload.url ??
-		`https://${baseIdentity.host}/${baseIdentity.owner}/${baseIdentity.repo}/pull/${payload.number}`;
-	const headOwner =
-		payload.headRepositoryOwner?.login ?? payload.headRepository?.owner?.login;
-	const headRepoName = payload.headRepository?.name;
-	const crossRepository =
-		payload.isCrossRepository ??
-		Boolean(
-			headOwner &&
-				headRepoName &&
-				(headOwner.toLowerCase() !== baseIdentity.owner.toLowerCase() ||
-					headRepoName.toLowerCase() !== baseIdentity.repo.toLowerCase()),
-		);
-	const maintainerCanModify = payload.maintainerCanModify ?? false;
-
-	const branch = `pr-${payload.number}`;
+	const plan = planCheckoutTarget(payload, baseIdentity);
+	const { branch, headRefName, pullUrl, crossRepository, maintainerCanModify } =
+		plan;
 
 	// The lock guards every shared-metadata mutation below (§31).
 	return deps.mutationLock.withLock(lockIdentity, async () => {
 		// 1. Materialize the PR head commit locally.
+		// 1. Materialize the PR head commit locally.
 		let fetchRemote = "origin";
-		if (crossRepository && headOwner && headRepoName) {
-			fetchRemote = await resolveForkRemote(deps.git, deps.cwd, signal, {
-				host: baseIdentity.host,
-				owner: headOwner,
-				name: headRepoName,
-			});
+		if (plan.fetch.kind === "fork") {
+			fetchRemote = await resolveForkRemote(
+				deps.git,
+				deps.cwd,
+				signal,
+				plan.fetch.head,
+			);
 			const fetched = await runGit(
 				deps.git,
-				["fetch", fetchRemote, headRefName],
+				["fetch", fetchRemote, plan.fetch.ref],
 				deps.cwd,
 				signal,
 			);
 			if (fetched.exitCode !== 0) {
 				throw new GitRepositoryError(
-					`Fetching the fork branch ${headRefName} from ${fetchRemote} failed: ${firstBoundedLine(fetched.stderr)}`,
+					`Fetching the fork branch ${plan.fetch.ref} from ${fetchRemote} failed: ${firstBoundedLine(fetched.stderr)}`,
 				);
 			}
 		} else {
 			const fetched = await runGit(
 				deps.git,
-				["fetch", "origin", `pull/${payload.number}/head`],
+				["fetch", "origin", plan.fetch.ref],
 				deps.cwd,
 				signal,
 			);
 			if (fetched.exitCode !== 0) {
 				throw new GitRepositoryError(
-					`Fetching pull/${payload.number}/head from origin failed: ${firstBoundedLine(fetched.stderr)}`,
+					`Fetching ${plan.fetch.ref} from origin failed: ${firstBoundedLine(fetched.stderr)}`,
 				);
 			}
 		}
@@ -843,26 +888,8 @@ async function resolveBaseIdentity(
 	explicitRepo: string | undefined,
 	signal: AbortSignal | undefined,
 ): Promise<BaseIdentity> {
-	if (parsed.kind === "url") {
-		return { host: parsed.host, owner: parsed.owner, repo: parsed.repo };
-	}
-	if (explicitRepo) {
-		const segments = explicitRepo.trim().split("/").filter(Boolean);
-		if (segments.length === 3) {
-			return {
-				host: segments[0] ?? "",
-				owner: segments[1] ?? "",
-				repo: segments[2] ?? "",
-			};
-		}
-		if (segments.length === 2) {
-			return {
-				host: deps.env.GH_HOST ?? "github.com",
-				owner: segments[0] ?? "",
-				repo: segments[1] ?? "",
-			};
-		}
-	}
+	const planned = planBaseIdentity(parsed, explicitRepo, deps.env.GH_HOST);
+	if (planned) return planned;
 	const current = await resolveCurrentGithubRepo(
 		{ git: deps.git, env: deps.env },
 		signal,
@@ -956,14 +983,7 @@ export async function checkoutPullRequests(
 	target: PrCheckoutTarget,
 	signal?: AbortSignal,
 ): Promise<PrCheckoutOutcome> {
-	const identifiers = (Array.isArray(target.pr) ? target.pr : [target.pr])
-		.map((value) => value.trim())
-		.filter((value) => value !== "");
-	if (identifiers.length === 0) {
-		throw new PiOmpGitError(
-			"The `pr` parameter is required for pr_checkout — a PR number as text, a PR URL, or a branch-like identifier.",
-		);
-	}
+	const identifiers = planPrCheckoutBatch(target.pr);
 
 	const repoRoot = await resolveRepoRoot(deps.git, deps.cwd, signal);
 	const lockIdentity = await resolveCommonGitDir(

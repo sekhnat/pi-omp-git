@@ -14,9 +14,11 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	checkRunUrlRepoConflict,
+	parseRunIdentifier,
+} from "../src/github/operations/planning.ts";
+import {
 	DEFAULT_LOG_TAIL_LINES,
 	MAX_LOG_TAIL_LINES,
-	parseRunIdentifier,
 	pollIntervalMs,
 	type RunWatchDetails,
 	type RunWatchTarget,

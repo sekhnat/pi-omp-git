@@ -11,8 +11,9 @@
  */
 
 import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { type Static, Type } from "typebox";
 import type { GitRunner } from "../../git/runner.ts";
 import {
 	ActionsRateLimitError,
@@ -20,11 +21,15 @@ import {
 	PiOmpGitError,
 } from "../../shared/errors.ts";
 import type { CheckoutRecord } from "../last-checkout.ts";
-import {
-	parseGithubRepoIdentifier,
-	resolveCurrentGithubRepo,
-} from "../repo.ts";
+import { resolveCurrentGithubRepo } from "../repo.ts";
 import type { GhRunner } from "../runner.ts";
+import { GithubParamsError, optionalNonEmptyString } from "./params.ts";
+import {
+	type CommitShaSourcePlan,
+	type GithubRepoIdentity,
+	planCommitShaSource,
+	planWatchTarget,
+} from "./planning.ts";
 
 /** Poll cadences and budgets — parity values from §41. */
 export const FAST_POLL_INTERVAL_MS = 3_000;
@@ -150,6 +155,61 @@ export interface RunWatchTarget {
 	tail?: number;
 }
 
+export const RUN_WATCH_OPERATION_PARAMETERS = Type.Object({
+	op: Type.Literal("run_watch"),
+	run: Type.Optional(Type.String()),
+	commit: Type.Optional(Type.String()),
+	pr: Type.Optional(Type.String()),
+	repo: Type.Optional(Type.String()),
+	tail: Type.Optional(Type.Number()),
+});
+
+export type RunWatchOperationArguments = Static<
+	typeof RUN_WATCH_OPERATION_PARAMETERS
+>;
+
+export function validateRunWatchOperationArguments(
+	params: Record<string, unknown>,
+): RunWatchOperationArguments {
+	const rawPr = params.pr;
+	if (Array.isArray(rawPr)) {
+		throw new GithubParamsError(
+			"run_watch accepts a single PR; the array form of `pr` is valid for pr_checkout batching only.",
+		);
+	}
+	const run = optionalNonEmptyString(params, "run");
+	const commit = optionalNonEmptyString(params, "commit");
+	const pr = optionalNonEmptyString(params, "pr");
+	const repo = optionalNonEmptyString(params, "repo");
+	if (run !== undefined && (commit !== undefined || pr !== undefined)) {
+		throw new GithubParamsError(
+			"run_watch accepts either `run` (run mode) or `commit`/`pr` (commit mode), not both.",
+		);
+	}
+	const rawTail = params.tail;
+	let tail: number | undefined;
+	if (rawTail !== undefined && rawTail !== null) {
+		if (
+			typeof rawTail !== "number" ||
+			!Number.isFinite(rawTail) ||
+			rawTail <= 0
+		) {
+			throw new GithubParamsError(
+				"The `tail` parameter must be a positive number of log lines (max 200).",
+			);
+		}
+		tail = Math.min(200, Math.floor(rawTail));
+	}
+	return {
+		op: "run_watch",
+		...(run !== undefined ? { run } : {}),
+		...(commit !== undefined ? { commit } : {}),
+		...(pr !== undefined ? { pr } : {}),
+		...(repo !== undefined ? { repo } : {}),
+		...(tail !== undefined ? { tail } : {}),
+	};
+}
+
 export interface RunWatchDeps {
 	gh: GhRunner;
 	git: GitRunner;
@@ -165,76 +225,6 @@ export interface RunWatchDeps {
 	signal?: AbortSignal;
 	/** Streaming progress updates (§45). */
 	onUpdate?: (details: RunWatchDetails) => void;
-}
-
-interface ParsedRunRef {
-	kind: "number";
-	number: number;
-}
-
-interface ParsedRunUrl {
-	kind: "url";
-	host: string;
-	owner: string;
-	repo: string;
-	number: number;
-}
-
-/**
- * `run` accepts a bare run ID or a GitHub Actions run URL:
- * `https://<host>/<owner>/<repo>/actions/runs/<id>` (optional
- * `/attempts/<n>` suffix). Everything else is invalid.
- */
-export function parseRunIdentifier(
-	text: string,
-): ParsedRunRef | ParsedRunUrl | null {
-	const trimmed = text.trim();
-	if (trimmed === "") return null;
-	if (/^\d+$/.test(trimmed)) {
-		return { kind: "number", number: Number(trimmed) };
-	}
-	if (/^https?:\/\//i.test(trimmed)) {
-		const match =
-			/^https?:\/\/([^/\s]+)\/([^/\s]+)\/([^/\s]+)\/actions\/runs\/(\d+)(?:\/attempts\/\d+)?\/?$/i.exec(
-				trimmed,
-			);
-		if (!match) return null;
-		return {
-			kind: "url",
-			host: match[1]?.toLowerCase() ?? "github.com",
-			owner: match[2] ?? "",
-			repo: match[3] ?? "",
-			number: Number(match[4]),
-		};
-	}
-	return null;
-}
-
-/** A run URL and an explicit `repo` must agree (divergence D3 pattern). */
-export function checkRunUrlRepoConflict(
-	parsed: ParsedRunUrl,
-	repoParam: string | undefined,
-): void {
-	if (!repoParam) return;
-	const explicit = parseGithubRepoIdentifier(repoParam);
-	if (!explicit) return;
-	if (
-		explicit.host &&
-		parsed.host &&
-		explicit.host.toLowerCase() !== parsed.host
-	) {
-		throw new PiOmpGitError(
-			`The Actions run URL points at ${parsed.host} but \`repo\` targets ${explicit.host}. Pass the matching repository or omit \`repo\`.`,
-		);
-	}
-	if (
-		explicit.owner.toLowerCase() !== parsed.owner.toLowerCase() ||
-		explicit.repo.toLowerCase() !== parsed.repo.toLowerCase()
-	) {
-		throw new PiOmpGitError(
-			`The Actions run URL points at ${parsed.owner}/${parsed.repo} but \`repo\` targets ${explicit.owner}/${explicit.repo}. Pass the matching repository or omit \`repo\`.`,
-		);
-	}
 }
 
 interface RunViewPayload {
@@ -370,44 +360,23 @@ export async function watchActions(
 	};
 
 	// ---- target resolution ---------------------------------------------
-	const mode: "run" | "commit" = target.run ? "run" : "commit";
+	const plan = planWatchTarget(target);
+	const mode: "run" | "commit" = plan.mode;
 	let repoLabel: string;
-	let identity: { host: string; owner: string; repo: string } | null = null;
+	let identity: GithubRepoIdentity | null = null;
 	let runNumber: number | null = null;
 	let commitSha: string | null = null;
 
-	if (target.run) {
-		const parsed = parseRunIdentifier(target.run);
-		if (!parsed) {
-			throw new PiOmpGitError(
-				`\`run\` must be a run ID or a GitHub Actions run URL — got ${JSON.stringify(target.run)}.`,
-			);
-		}
-		runNumber = parsed.number;
-		if (parsed.kind === "url") {
-			checkRunUrlRepoConflict(parsed, target.repo);
-			identity = { host: parsed.host, owner: parsed.owner, repo: parsed.repo };
-		}
+	if (plan.mode === "run") {
+		runNumber = plan.runNumber ?? null;
+		if (plan.urlIdentity) identity = plan.urlIdentity;
 	} else {
 		commitSha = await resolveCommitSha(deps, target);
 	}
 
 	if (!identity) {
-		if (target.repo) {
-			const parsed = parseGithubRepoIdentifier(target.repo);
-			if (!parsed) {
-				throw new PiOmpGitError(
-					`\`repo\` must be owner/repo or host/owner/repo — got ${JSON.stringify(target.repo)}.`,
-				);
-			}
-			identity = {
-				host: parsed.host ?? "github.com",
-				owner: parsed.owner,
-				repo: parsed.repo,
-			};
-		} else {
-			identity = await resolveCurrentGithubRepo(deps, signal);
-		}
+		identity =
+			plan.repoIdentity ?? (await resolveCurrentGithubRepo(deps, signal));
 	}
 	repoLabel = `${identity.owner}/${identity.repo}`;
 	const repoFlag = ["-R", repoLabel] as const;
@@ -634,18 +603,15 @@ async function resolveCommitSha(
 	deps: RunWatchDeps,
 	target: RunWatchTarget,
 ): Promise<string> {
-	if (target.commit) {
-		const sha = target.commit.trim();
-		if (!/^[0-9a-f]{4,40}$/i.test(sha)) {
-			throw new PiOmpGitError(
-				`\`commit\` must be a commit SHA — got ${JSON.stringify(target.commit)}.`,
-			);
-		}
-		return sha;
-	}
-	if (target.pr) {
+	const source: CommitShaSourcePlan = planCommitShaSource({
+		commit: target.commit,
+		pr: target.pr,
+		lastBranch: deps.getLastCheckout?.()?.branch ?? null,
+	});
+	if (source.kind === "commit") return source.sha;
+	if (source.kind === "pr") {
 		const result = await deps.gh.run(
-			["pr", "view", target.pr.trim(), "--json", "headRefOid"],
+			["pr", "view", source.pr, "--json", "headRefOid"],
 			{ signal: deps.signal, cwd: deps.cwd },
 		);
 		if (result.exitCode !== 0) {
@@ -663,10 +629,9 @@ async function resolveCommitSha(
 			);
 		}
 	}
-	const last = deps.getLastCheckout?.() ?? null;
-	if (last?.branch) {
+	if (source.kind === "last-checkout") {
 		const result = await deps.git.run(
-			["rev-parse", `refs/heads/${last.branch}`],
+			["rev-parse", `refs/heads/${source.branch}`],
 			{ signal: deps.signal, cwd: deps.cwd },
 		);
 		if (result.exitCode === 0 && result.stdout.trim() !== "") {
@@ -706,8 +671,7 @@ async function collectFinalRuns(
 		Math.max(1, Math.floor(tailParam ?? DEFAULT_LOG_TAIL_LINES)),
 	);
 	const artifactsDir =
-		context.artifactsDir ??
-		join(homedir(), ".pi", "agent", "artifacts", "pi-omp-git");
+		context.artifactsDir ?? join(getAgentDir(), "artifacts", "pi-omp-git");
 	const finalRuns: RunWatchRunState[] = [];
 	for (const run of runs) {
 		const next: RunWatchRunState = { ...run };

@@ -348,7 +348,11 @@ async function runCommitCommand(
 	return { short: after.slice(0, 8), subject: subject.stdout.trim() };
 }
 
-async function restoreIndex(deps: ExecuteDeps, tree: string): Promise<void> {
+/** Restore the index to a snapshot tree (used by split and all-changes paths). */
+export async function restoreIndex(
+	deps: ExecuteDeps,
+	tree: string,
+): Promise<void> {
 	const result = await deps.git.run(["read-tree", tree], { cwd: deps.cwd });
 	if (result.exitCode !== 0) {
 		throw new PiOmpGitError(

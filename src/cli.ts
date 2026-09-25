@@ -7,16 +7,20 @@
  * rendering matches the in-Pi experience. It requires an interactive
  * TTY.
  *
- * `pi-omp-git commit [--push] [--dry-run] [--no-changelog]
+ * `pi-omp-git commit [--all] [--push] [--dry-run] [--no-changelog]
  * [--context <text>] [--model <model>] [-C dir]` runs the same agentic
  * commit pipeline as the `/commit` command (ADR 0004: one pipeline
- * implementation, two hosts).
+ * implementation, two hosts). Commits the staged set by default;
+ * `--all` opts into staging the full change set.
  */
 
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import {
+	getAgentDir,
+	ModelRegistry,
+	ModelRuntime,
+} from "@earendil-works/pi-coding-agent";
 import { ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
+import { type CommitArgs, parseCommitTokens } from "./git/commit-args.ts";
 import { runCommitPipeline } from "./git/commit-pipeline.ts";
 import { collectRevisionStatus, resolveRevision } from "./git/revision.ts";
 import { createGitRunner } from "./git/runner.ts";
@@ -29,14 +33,43 @@ import { GitTuiComponent, GitTuiController } from "./git/tui.ts";
 import type { NestedModel } from "./github/nested-agent.ts";
 import { createGhRunner } from "./github/runner.ts";
 import { COMMIT_DEFAULTS, loadConfig } from "./shared/config.ts";
+import {
+	type CollectDoctorOptions,
+	collectDoctorReport,
+	formatDoctorReport,
+} from "./shared/doctor.ts";
 
+export function getCliAgentDir(): string {
+	return getAgentDir();
+}
+
+export function resolveCliConfig(cwd: string) {
+	return loadConfig({
+		agentDir: getCliAgentDir(),
+		cwd,
+		env: process.env,
+		projectTrusted: false,
+	});
+}
+
+export async function runDoctorCommand(
+	options: CollectDoctorOptions,
+	writeOutput: (text: string) => void = (text) => process.stdout.write(text),
+): Promise<number> {
+	const report = await collectDoctorReport(options);
+	writeOutput(`${formatDoctorReport(report)}\n`);
+	return 0;
+}
 export const USAGE = `pi-omp-git — OMP Git/GitHub parity for Pi
 
 Usage:
   pi-omp-git git [revision] [-C <dir>]   Interactive Git TUI (requires a TTY)
   pi-omp-git commit [options]            Agentic commit pipeline
+  pi-omp-git doctor                     Local environment diagnostics
 
 Commit options:
+  --all             Stage and commit all tracked modifications, deletions,
+                    and untracked files (default: staged changes only)
   --push            Push after commits succeed
   --dry-run         Print the plan; commit and push nothing
   --no-changelog    Skip the changelog integration
@@ -50,6 +83,7 @@ interface ParsedArgs {
 	dir?: string;
 	push: boolean;
 	dryRun: boolean;
+	all: boolean;
 	noChangelog: boolean;
 	context?: string;
 	model?: string;
@@ -59,6 +93,7 @@ export function parseCliArgs(args: string[]): ParsedArgs {
 	const parsed: ParsedArgs = {
 		push: false,
 		dryRun: false,
+		all: false,
 		noChangelog: false,
 	};
 	const positional: string[] = [];
@@ -74,6 +109,8 @@ export function parseCliArgs(args: string[]): ParsedArgs {
 			index += 1;
 		} else if (token === "--push") {
 			parsed.push = true;
+		} else if (token === "--all") {
+			parsed.all = true;
 		} else if (token === "--dry-run") {
 			parsed.dryRun = true;
 		} else if (token === "--no-changelog") {
@@ -146,7 +183,7 @@ export async function runGitCommand(
 	// The binary creates its own terminal renderer with the same
 	// @earendil-works/pi-tui component library, so rendering matches the
 	// in-Pi experience (§60).
-	const agentDir = join(homedir(), ".pi", "agent");
+	const agentDir = getCliAgentDir();
 	const tui = new TuiMainScreen(new ProcessTerminal(), false, agentDir);
 	let settled = false;
 	return await new Promise<number>((resolve) => {
@@ -170,17 +207,50 @@ export async function runGitCommand(
 	});
 }
 
+/**
+ * CLI commit arguments: the CLI-only `-C <dir>` is extracted first, then
+ * the remaining tokens go through the shared strict commit-option parser
+ * (§73) so both hosts reject the same invalid forms.
+ */
+export function parseCommitCliArgs(args: string[]): {
+	dir?: string;
+	options: CommitArgs;
+} {
+	const dirs: string[] = [];
+	const commitTokens: string[] = [];
+	for (let index = 0; index < args.length; index += 1) {
+		const token = args[index];
+		if (token === undefined) continue;
+		if (token === "-C") {
+			const value = args[index + 1];
+			if (value === undefined) {
+				throw new Error("-C requires a directory argument");
+			}
+			dirs.push(value);
+			index += 1;
+			continue;
+		}
+		commitTokens.push(token);
+	}
+	if (dirs.length > 1) {
+		throw new Error("-C was given more than once.");
+	}
+	return {
+		...(dirs[0] !== undefined ? { dir: dirs[0] } : {}),
+		options: parseCommitTokens(commitTokens),
+	};
+}
+
 /** `pi-omp-git commit` — the standalone agentic commit pipeline (§73). */
 export async function runCommitCommand(args: string[]): Promise<number> {
-	const parsed = parseCliArgs(args);
-	const cwd = parsed.dir ?? process.cwd();
-	const agentDir = join(homedir(), ".pi", "agent");
-	const config = loadConfig({
-		agentDir,
-		cwd,
-		env: process.env,
-		projectTrusted: false,
-	});
+	const { dir, options: parsed } = parseCommitCliArgs(args);
+	const cwd = dir ?? process.cwd();
+	const config = resolveCliConfig(cwd);
+	if (parsed.push && !config.github.enabled) {
+		throw new Error(
+			"GitHub integration is disabled by configuration; --push requires GitHub integration.",
+		);
+	}
 	const settings = config.commit;
 	const model = parsed.model
 		? await resolveStandaloneModel(parsed.model)
@@ -211,6 +281,7 @@ export async function runCommitCommand(args: string[]): Promise<number> {
 		{
 			...(parsed.dryRun ? { dryRun: true } : {}),
 			...(parsed.push ? { push: true } : {}),
+			...(parsed.all ? { all: true } : {}),
 			...(parsed.noChangelog ? { noChangelog: true } : {}),
 			...(parsed.context ? { context: parsed.context } : {}),
 			// Noninteractive host: splitPolicy `confirm` fails explicitly
@@ -256,6 +327,18 @@ export async function cliMain(argv: string[]): Promise<number> {
 			return await runGitCommand(rest, {
 				isTTY: !!process.stdin.isTTY && !!process.stdout.isTTY,
 			});
+		if (command === "doctor") {
+			if (rest.length > 0) {
+				process.stderr.write("The doctor command does not accept arguments.\n");
+				return 1;
+			}
+			return await runDoctorCommand({
+				agentDir: getCliAgentDir(),
+				cwd: process.cwd(),
+				env: process.env,
+				projectTrusted: false,
+			});
+		}
 		if (command === "commit") return await runCommitCommand(rest);
 		process.stderr.write(`Unknown command: ${command}\n\n${USAGE}`);
 		return 1;

@@ -7,6 +7,16 @@
  * fixture seam; unknown argv is recorded and rejected.
  */
 
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createGitRunner } from "../src/git/runner.ts";
 import { createAvailability } from "../src/github/availability.ts";
@@ -61,7 +71,10 @@ interface CapturedCall {
 	env: Record<string, string>;
 }
 
-function buildTool(fixtureOverrides: GhFixtureMap = {}) {
+function buildTool(
+	fixtureOverrides: GhFixtureMap = {},
+	githubEnabled: () => boolean = () => true,
+) {
 	const fixtures: GhFixtureMap = {
 		"gh --version": { stdout: "gh version 2.40.0\n", exitCode: 0 },
 		"gh auth status": { exitCode: 0 },
@@ -94,6 +107,7 @@ function buildTool(fixtureOverrides: GhFixtureMap = {}) {
 		git: createGitRunner({ exec }),
 		availability: createAvailability(runner),
 		env: { GH_TOKEN: "test-token" },
+		githubEnabled,
 	});
 	return { tool, calls, fixtures };
 }
@@ -1244,22 +1258,145 @@ describe("executeGithubOperation", () => {
 					stdout: JSON.stringify(runPayload),
 				},
 		});
-		const outcome = await callGithub(tool, {
-			op: "run_watch",
-			run: "100",
-			repo: "owner/repo",
-		});
+		const updates: string[] = [];
+		const outcome = await tool.execute(
+			"test-call-id",
+			{ op: "run_watch", run: "100", repo: "owner/repo" } as never,
+			undefined,
+			(update) => {
+				if (update.details?.op) updates.push(update.details.op);
+			},
+		);
 		expect(outcome.details).toMatchObject({
 			op: "run_watch",
 			repo: "owner/repo",
 			runId: 100,
 			outcome: "success",
 		});
+		expect(updates).toContain("run_watch");
 		const text = outcome.content
 			.map((part) => (part.type === "text" ? part.text : ""))
 			.join("");
 		expect(text).toContain("succeeded");
 		expect(text).toContain("ci: unit tests");
+	});
+});
+describe("GitHub dispatcher disabled gate", () => {
+	it("blocks reads and mutations before any gh request and rechecks the live gate", async () => {
+		let enabled = false;
+		const { tool, calls } = buildTool({}, () => enabled);
+		for (const params of [
+			{ op: "repo_view", repo: "owner/repo" },
+			{ op: "pr_create", title: "Test", body: "Body" },
+		]) {
+			await expect(callGithub(tool, params)).rejects.toThrow(
+				/GitHub integration is disabled/i,
+			);
+		}
+		expect(calls).toEqual([]);
+
+		enabled = true;
+		await expect(callGithub(tool, { op: "not-an-operation" })).rejects.toThrow(
+			/unknown github operation/i,
+		);
+	});
+});
+
+describe("GitHub disabled extension guidance", () => {
+	it("does not append GitHub-specific prompt guidance", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "pi-omp-git-disabled-"));
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousPath = process.env.PATH;
+		try {
+			writeFileSync(
+				join(agentDir, "pi-omp-git.json"),
+				JSON.stringify({ github: { enabled: false } }),
+			);
+			const fakeBin = join(agentDir, "bin");
+			mkdirSync(fakeBin);
+			const ghLog = join(agentDir, "gh-called");
+			const fakeGh = join(fakeBin, "gh");
+			writeFileSync(fakeGh, `#!/bin/sh\nprintf called >> "${ghLog}"\n`);
+			chmodSync(fakeGh, 0o755);
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			process.env.PATH = `${fakeBin}${delimiter}${previousPath ?? ""}`;
+
+			const mod = await import("../src/index.ts");
+			const handlers = new Map<
+				string,
+				(event: unknown, ctx: unknown) => unknown
+			>();
+			const tools: Array<{ name: string }> = [];
+			const commands: string[] = [];
+			const commandHandlers = new Map<
+				string,
+				(args: string, ctx: unknown) => unknown
+			>();
+			let activeTools = ["read", "github", "bash"];
+			const fakePi = {
+				on: (
+					name: string,
+					handler: (event: unknown, ctx: unknown) => unknown,
+				) => {
+					handlers.set(name, handler);
+				},
+				registerTool: (tool: { name: string }) => {
+					tools.push(tool);
+				},
+				registerCommand: (
+					name: string,
+					definition: { handler: (args: string, ctx: unknown) => unknown },
+				) => {
+					commands.push(name);
+					commandHandlers.set(name, definition.handler);
+				},
+				getActiveTools: () => activeTools,
+				setActiveTools: (names: string[]) => {
+					activeTools = [...names];
+				},
+			} as unknown as Parameters<(typeof mod)["default"]>[0];
+			mod.default(fakePi);
+			const doctorReports: string[] = [];
+			await commandHandlers.get("omp-git-doctor")?.("", {
+				ui: { notify: (message: string) => doctorReports.push(message) },
+			});
+			const doctorText = doctorReports.join("\n");
+			expect(doctorText).toContain("GitHub integration: disabled");
+			expect(doctorText).toContain(
+				"GitHub auth: GitHub integration is disabled by configuration.",
+			);
+			expect(existsSync(ghLog)).toBe(false);
+			expect(commands).toContain("git");
+			expect(commands).toContain("commit");
+			expect(tools.map((tool) => tool.name)).toContain("read");
+
+			const guidelines: string[] = [];
+			handlers.get("before_agent_start")?.(
+				{ systemPromptOptions: { promptGuidelines: guidelines } },
+				{},
+			);
+			expect(guidelines).toEqual([]);
+			expect(activeTools).not.toContain("github");
+
+			writeFileSync(
+				join(agentDir, "pi-omp-git.json"),
+				JSON.stringify({ github: { enabled: true } }),
+			);
+			const enabledGuidelines: string[] = [];
+			handlers.get("before_agent_start")?.(
+				{ systemPromptOptions: { promptGuidelines: enabledGuidelines } },
+				{},
+			);
+			expect(activeTools).toContain("github");
+			expect(enabledGuidelines).toEqual(GITHUB_PROMPT_GUIDELINES);
+		} finally {
+			if (previousAgentDir === undefined)
+				delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+			rmSync(agentDir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -1271,6 +1408,7 @@ describe("prompt guidelines via the system-prompt build hook", () => {
 			(event: unknown, ctx: unknown) => unknown
 		>();
 		const tools: Array<{ name: string }> = [];
+		let activeTools = ["read", "github", "bash"];
 		const fakePi = {
 			on: (
 				name: string,
@@ -1282,6 +1420,10 @@ describe("prompt guidelines via the system-prompt build hook", () => {
 				tools.push(tool);
 			},
 			registerCommand: () => {},
+			getActiveTools: () => activeTools,
+			setActiveTools: (names: string[]) => {
+				activeTools = [...names];
+			},
 		} as unknown as Parameters<(typeof mod)["default"]>[0];
 		mod.default(fakePi as never);
 

@@ -42,7 +42,7 @@ function git(args: string[], cwd: string): string {
 	return execFileSync("git", args, {
 		cwd,
 		encoding: "utf8",
-		env: { ...process.env, LC_ALL: "C", GIT_CONFIG_GLOBAL: "/dev/null" },
+		env: { ...process.env, LC_ALL: "C" },
 	});
 }
 

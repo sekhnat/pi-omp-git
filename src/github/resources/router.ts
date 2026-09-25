@@ -25,6 +25,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { GitRunner } from "../../git/runner.ts";
 import type { ResolvedConfig } from "../../shared/config.ts";
+import { PiOmpGitError } from "../../shared/errors.ts";
 import type { Availability } from "../availability.ts";
 import { credentialFingerprint } from "../cache/auth-key.ts";
 import { createGithubCache, type GithubCache } from "../cache/cache.ts";
@@ -317,6 +318,11 @@ export function createGithubReadOverride(
 			if (!isGithubResourceUri(params.path)) {
 				return deps.nativeRead.execute(toolCallId, params, signal, onUpdate);
 			}
+			if (!deps.getConfig().github.enabled) {
+				throw new PiOmpGitError(
+					"GitHub integration is disabled by configuration.",
+				);
+			}
 			const resource = parseGithubUri(params.path);
 			const rendered = await readGithubResource(
 				deps,
@@ -337,7 +343,13 @@ export function createGithubReadOverride(
 export function createGithubCacheForDeps(deps: GithubReadDeps): GithubCache {
 	return createGithubCache({
 		getStore: () => openCacheStore(deps.getConfig().cacheDatabasePath),
-		getSettings: () => deps.getConfig().github.cache,
+		getSettings: () => {
+			const config = deps.getConfig();
+			return {
+				...config.github.cache,
+				enabled: config.github.enabled && config.github.cache.enabled,
+			};
+		},
 		authKey: () => credentialFingerprint(deps.env),
 	});
 }

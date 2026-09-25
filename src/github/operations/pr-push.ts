@@ -16,6 +16,7 @@
  * invalidates that PR's cached views and diffs (§33).
  */
 
+import { type Static, Type } from "typebox";
 import type { GitRunner } from "../../git/runner.ts";
 import {
 	AuthenticationError,
@@ -33,6 +34,7 @@ import type { CacheIdentity, GithubCache } from "../cache/cache.ts";
 import type { CheckoutRecord } from "../last-checkout.ts";
 import { parsePrIdentifier } from "../pr-ref.ts";
 import type { GhRunner } from "../runner.ts";
+import { GithubParamsError, optionalNonEmptyString } from "./params.ts";
 
 export interface PrPushDeps {
 	gh: GhRunner;
@@ -49,6 +51,45 @@ export interface PrPushTarget {
 	pr?: string;
 	branch?: string;
 	forceWithLease?: boolean;
+}
+
+export const PR_PUSH_OPERATION_PARAMETERS = Type.Object({
+	op: Type.Literal("pr_push"),
+	pr: Type.Optional(Type.String()),
+	branch: Type.Optional(Type.String()),
+	forceWithLease: Type.Optional(Type.Boolean()),
+});
+
+export type PrPushOperationArguments = Static<
+	typeof PR_PUSH_OPERATION_PARAMETERS
+>;
+
+export function validatePrPushOperationArguments(
+	params: Record<string, unknown>,
+): PrPushOperationArguments {
+	if (Array.isArray(params.pr)) {
+		throw new GithubParamsError(
+			"pr_push accepts a single PR; the array form of `pr` is valid for pr_checkout batching only.",
+		);
+	}
+	const pr = optionalNonEmptyString(params, "pr");
+	const branch = optionalNonEmptyString(params, "branch");
+	const forceWithLease = params.forceWithLease;
+	if (
+		forceWithLease !== undefined &&
+		forceWithLease !== null &&
+		typeof forceWithLease !== "boolean"
+	) {
+		throw new GithubParamsError(
+			"The `forceWithLease` parameter must be a boolean.",
+		);
+	}
+	return {
+		op: "pr_push",
+		...(pr !== undefined ? { pr } : {}),
+		...(branch !== undefined ? { branch } : {}),
+		...(typeof forceWithLease === "boolean" ? { forceWithLease } : {}),
+	};
 }
 
 export type PrPushResolution =

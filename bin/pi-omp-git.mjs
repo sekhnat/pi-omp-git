@@ -5,6 +5,6 @@
  * @earendil-works/pi-tui component library; `pi-omp-git commit` runs the
  * same agentic commit pipeline as the `/commit` command.
  */
-import { cliMain } from "../src/cli.ts";
+import { cliMain } from "../dist/cli.js";
 
 process.exitCode = await cliMain(process.argv.slice(2));

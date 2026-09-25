@@ -41,7 +41,7 @@ function git(args: string[], cwd: string): string {
 	return execFileSync("git", args, {
 		cwd,
 		encoding: "utf8",
-		env: { ...process.env, LC_ALL: "C", GIT_CONFIG_GLOBAL: "/dev/null" },
+		env: { ...process.env, LC_ALL: "C" },
 	}).trim();
 }
 
@@ -55,7 +55,7 @@ function makeClone(from: string, name: string): string {
 	const dir = join(tempDir("pi-omp-git-clone-"), name);
 	execFileSync("git", ["clone", from, dir], {
 		cwd: tempDir("pi-omp-git-root-"),
-		env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+		env: { ...process.env },
 	});
 	git(["config", "user.email", "agent@example.com"], dir);
 	git(["config", "user.name", "Agent"], dir);

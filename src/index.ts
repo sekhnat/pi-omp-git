@@ -10,13 +10,12 @@
  * cache database open lazily on first use.
  */
 
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { createReadTool } from "@earendil-works/pi-coding-agent";
+import { createReadTool, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { type CommitArgs, parseCommitArgs } from "./git/commit-args.ts";
 import { runCommitPipeline } from "./git/commit-pipeline.ts";
 import { createMutationLock } from "./git/mutation-lock.ts";
 import { collectRevisionStatus, resolveRevision } from "./git/revision.ts";
@@ -54,17 +53,21 @@ import {
 	loadConfig,
 	type ResolvedConfig,
 } from "./shared/config.ts";
+import { collectDoctorReport, formatDoctorReport } from "./shared/doctor.ts";
 import type { Runner } from "./shared/subprocess.ts";
 import { createRunner } from "./shared/subprocess.ts";
 
 /** Session-scoped wiring later tickets build on. */
 export interface OmpGitContext {
 	runner: Runner;
+	agentDir: string;
+	cwd: string;
 	gh: GhRunner;
 	git: GitRunner;
 	availability: Availability;
 	cache: GithubCache;
 	getConfig: () => ResolvedConfig;
+	getProjectTrusted(): boolean;
 	nativeRead: ReturnType<typeof createReadTool>;
 	readOverride: GithubReadOverride;
 	githubTool: ReturnType<typeof createGithubTool>;
@@ -75,7 +78,7 @@ export interface OmpGitContext {
 
 export function createOmpGitContext(cwd?: string): OmpGitContext {
 	const projectDir = cwd ?? process.cwd();
-	const agentDir = join(homedir(), ".pi", "agent");
+	const agentDir = getAgentDir();
 	const runner = createRunner();
 	const gh = createGhRunner({ exec: undefined, cwd: projectDir });
 	const git = createGitRunner({ exec: undefined, cwd: projectDir });
@@ -89,7 +92,13 @@ export function createOmpGitContext(cwd?: string): OmpGitContext {
 
 	const cache = createGithubCache({
 		getStore: () => openCacheStore(getConfig().cacheDatabasePath),
-		getSettings: () => getConfig().github.cache,
+		getSettings: () => {
+			const config = getConfig();
+			return {
+				...config.github.cache,
+				enabled: config.github.enabled && config.github.cache.enabled,
+			};
+		},
 		authKey: () => credentialFingerprint(process.env),
 	});
 	const nativeRead = createReadTool(projectDir);
@@ -108,6 +117,7 @@ export function createOmpGitContext(cwd?: string): OmpGitContext {
 		git,
 		availability,
 		env: process.env,
+		githubEnabled: () => getConfig().github.enabled,
 		cache,
 		getWorktreeRoot: () => getConfig().worktreeRoot,
 		getArtifactsRoot: () => getConfig().artifactsRoot,
@@ -116,15 +126,19 @@ export function createOmpGitContext(cwd?: string): OmpGitContext {
 	const commandObserver = createGhMutationInvalidator({
 		cache,
 		env: process.env,
+		githubEnabled: () => getConfig().github.enabled,
 		git,
 	});
 	return {
 		runner,
 		gh,
+		agentDir,
+		cwd: projectDir,
 		git,
 		availability,
 		cache,
 		getConfig,
+		getProjectTrusted: () => projectTrusted,
 		nativeRead,
 		readOverride,
 		githubTool,
@@ -137,10 +151,29 @@ export function createOmpGitContext(cwd?: string): OmpGitContext {
 
 export default function piOmpGitExtension(pi: ExtensionAPI): void {
 	const ctx = createOmpGitContext();
+	let githubToolInitiallyActive: boolean | undefined;
+	const syncGithubToolActivation = (): void => {
+		const activeTools = pi.getActiveTools();
+		githubToolInitiallyActive ??= activeTools.includes("github");
+		const shouldBeActive =
+			ctx.getConfig().github.enabled && githubToolInitiallyActive;
+		const nextTools = shouldBeActive
+			? activeTools.includes("github")
+				? activeTools
+				: [...activeTools, "github"]
+			: activeTools.filter((name) => name !== "github");
+		if (
+			nextTools.length !== activeTools.length ||
+			nextTools.some((name, index) => name !== activeTools[index])
+		) {
+			pi.setActiveTools(nextTools);
+		}
+	};
 	// Project configuration is read only after project trust is granted
 	// (ticket 03); trust is resolved by the time a session starts.
 	pi.on("session_start", (_event, sessionCtx) => {
 		ctx.setProjectTrusted(sessionCtx.isProjectTrusted());
+		syncGithubToolActivation();
 	});
 
 	// `read` override (ticket 02): virtual GitHub URIs render; every other
@@ -209,6 +242,13 @@ export default function piOmpGitExtension(pi: ExtensionAPI): void {
 	// prefers these surfaces over curl/wget and scraping — appended as
 	// guideline bullets, never a rewritten prompt.
 	pi.on("before_agent_start", (event) => {
+		syncGithubToolActivation();
+		if (
+			!ctx.getConfig().github.enabled ||
+			!pi.getActiveTools().includes("github")
+		) {
+			return;
+		}
 		event.systemPromptOptions.promptGuidelines.push(
 			...GITHUB_PROMPT_GUIDELINES,
 		);
@@ -285,10 +325,17 @@ export default function piOmpGitExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("commit", {
 		description:
-			"Agentic commit pipeline — plans, proposes, and executes commits (--dry-run, --push, --no-changelog, --context, --model)",
+			"Agentic commit pipeline — plans, proposes, and executes commits (--all, --dry-run, --push, --no-changelog, --context, --model)",
 		handler: async (args, commandCtx) => {
-			const options = parseCommitArgs(args ?? "");
-			const settings = ctx.getConfig().commit;
+			// Argument errors are reported in the UI before any repository work.
+			const parsed = parseCommitArgsSafely(args ?? "");
+			if (!parsed.ok) {
+				commandCtx.ui.notify(parsed.message, "error");
+				return;
+			}
+			const options = parsed.options;
+			const config = ctx.getConfig();
+			const settings = config.commit;
 			// §78: split plans under `confirm` need the interactive dialog.
 			const confirmPlan =
 				settings.splitPolicy === "confirm" && commandCtx.hasUI
@@ -296,6 +343,11 @@ export default function piOmpGitExtension(pi: ExtensionAPI): void {
 							commandCtx.ui.confirm("Apply this commit plan?", plan)
 					: undefined;
 			try {
+				if (options.push && !config.github.enabled) {
+					throw new Error(
+						"GitHub integration is disabled by configuration; --push requires GitHub integration.",
+					);
+				}
 				await ctx.availability.git();
 				const model = await resolveCommitModel(options.model, commandCtx);
 				const result = await runCommitPipeline(
@@ -328,6 +380,7 @@ export default function piOmpGitExtension(pi: ExtensionAPI): void {
 					{
 						...(options.dryRun ? { dryRun: true } : {}),
 						...(options.push ? { push: true } : {}),
+						...(options.all ? { all: true } : {}),
 						...(options.noChangelog ? { noChangelog: true } : {}),
 						...(options.context ? { context: options.context } : {}),
 						...(confirmPlan ? { confirmPlan } : {}),
@@ -344,63 +397,38 @@ export default function piOmpGitExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("omp-git-doctor", {
-		description: "Report git and gh availability for pi-omp-git",
+		description:
+			"Report local Git, GitHub, configuration, and path diagnostics",
 		handler: async (_args, commandCtx) => {
-			const [git, gh] = await Promise.all([
-				ctx.availability.git(),
-				ctx.availability.gh(),
-			]);
-			const lines = [
-				`pi-omp-git doctor`,
-				`git: ${git.ok ? "available" : git.message}`,
-				`gh: ${gh.ok ? "available" : gh.message}`,
-			];
-			commandCtx.ui.notify(lines.join("\n"), "info");
+			const report = await collectDoctorReport({
+				agentDir: ctx.agentDir,
+				cwd: ctx.cwd,
+				env: process.env,
+				projectTrusted: ctx.getProjectTrusted(),
+				runner: ctx.runner,
+			});
+			commandCtx.ui.notify(formatDoctorReport(report), "info");
 		},
 	});
 }
 
-/** Parse `/commit` flags (§73): --dry-run, --push, --no-changelog, --context, --model. */
-export function parseCommitArgs(input: string): {
-	dryRun: boolean;
-	push: boolean;
-	noChangelog: boolean;
-	context?: string;
-	model?: string;
-} {
-	const tokens = input.split(/\s+/).filter((token) => token.length > 0);
-	const result: {
-		dryRun: boolean;
-		push: boolean;
-		noChangelog: boolean;
-		context?: string;
-		model?: string;
-	} = { dryRun: false, push: false, noChangelog: false };
-	for (let index = 0; index < tokens.length; index += 1) {
-		const token = tokens[index];
-		if (token === undefined) continue;
-		if (token === "--dry-run") result.dryRun = true;
-		else if (token === "--push") result.push = true;
-		else if (token === "--no-changelog") result.noChangelog = true;
-		else if (token === "--context") {
-			const value = tokens[index + 1];
-			if (value !== undefined) {
-				result.context = value;
-				index += 1;
-			}
-		} else if (token === "--model") {
-			const value = tokens[index + 1];
-			if (value !== undefined) {
-				result.model = value;
-				index += 1;
-			}
-		} else if (token.startsWith("--context=")) {
-			result.context = token.slice("--context=".length);
-		} else if (token.startsWith("--model=")) {
-			result.model = token.slice("--model=".length);
-		}
+export { parseCommitArgs };
+
+/**
+ * Parse `/commit` input (§73) without throwing, so argument errors are
+ * reported as a UI-visible failure before any repository work.
+ */
+export function parseCommitArgsSafely(
+	input: string,
+): { ok: true; options: CommitArgs } | { ok: false; message: string } {
+	try {
+		return { ok: true, options: parseCommitArgs(input) };
+	} catch (error) {
+		return {
+			ok: false,
+			message: error instanceof Error ? error.message : String(error),
+		};
 	}
-	return result;
 }
 
 /**

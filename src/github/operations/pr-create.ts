@@ -15,6 +15,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type Static, Type } from "typebox";
 import type { GitRunner } from "../../git/runner.ts";
 import {
 	AuthenticationError,
@@ -36,6 +37,7 @@ import { parseGithubRepoIdentifier } from "../repo.ts";
 import { fetchPullRequest, type PullTarget } from "../resources/prs.ts";
 import { renderPullRequest } from "../resources/render.ts";
 import type { GhRunner } from "../runner.ts";
+import { GithubParamsError, optionalNonEmptyString } from "./params.ts";
 
 export interface PrCreateTarget {
 	/** `owner/repo` or `host/owner/repo`; omitted → gh resolves the checkout. */
@@ -55,6 +57,80 @@ export interface PrCreateTarget {
 	reviewer?: string[];
 	assignee?: string[];
 	label?: string[];
+}
+
+export const PR_CREATE_OPERATION_PARAMETERS = Type.Object({
+	op: Type.Literal("pr_create"),
+	repo: Type.Optional(Type.String()),
+	title: Type.Optional(Type.String()),
+	body: Type.Optional(Type.String()),
+	base: Type.Optional(Type.String()),
+	head: Type.Optional(Type.String()),
+	draft: Type.Optional(Type.Boolean()),
+	fill: Type.Optional(Type.Boolean()),
+	reviewer: Type.Optional(Type.Array(Type.String())),
+	assignee: Type.Optional(Type.Array(Type.String())),
+	label: Type.Optional(Type.Array(Type.String())),
+});
+
+export type PrCreateOperationArguments = Static<
+	typeof PR_CREATE_OPERATION_PARAMETERS
+>;
+
+export function validatePrCreateOperationArguments(
+	params: Record<string, unknown>,
+): PrCreateOperationArguments {
+	const body = params.body;
+	if (body !== undefined && body !== null && typeof body !== "string") {
+		throw new GithubParamsError(
+			"The `body` parameter must be a string (empty is allowed).",
+		);
+	}
+	const readBoolean = (field: "draft" | "fill"): boolean | undefined => {
+		const value = params[field];
+		if (value === undefined || value === null) return undefined;
+		if (typeof value !== "boolean") {
+			throw new GithubParamsError(
+				`The \`${field}\` parameter must be a boolean.`,
+			);
+		}
+		return value;
+	};
+	const readStringArray = (field: "reviewer" | "assignee" | "label") => {
+		const value = params[field];
+		if (value === undefined || value === null) return undefined;
+		if (
+			!Array.isArray(value) ||
+			value.some((item) => typeof item !== "string" || item.trim() === "")
+		) {
+			throw new GithubParamsError(
+				`The \`${field}\` parameter must be an array of non-empty strings.`,
+			);
+		}
+		return value as string[];
+	};
+	const repo = optionalNonEmptyString(params, "repo");
+	const title = optionalNonEmptyString(params, "title");
+	const base = optionalNonEmptyString(params, "base");
+	const head = optionalNonEmptyString(params, "head");
+	const draft = readBoolean("draft");
+	const fill = readBoolean("fill");
+	const reviewer = readStringArray("reviewer");
+	const assignee = readStringArray("assignee");
+	const label = readStringArray("label");
+	return {
+		op: "pr_create",
+		...(repo !== undefined ? { repo } : {}),
+		...(title !== undefined ? { title } : {}),
+		...(body !== undefined && body !== null ? { body } : {}),
+		...(base !== undefined ? { base } : {}),
+		...(head !== undefined ? { head } : {}),
+		...(draft !== undefined ? { draft } : {}),
+		...(fill !== undefined ? { fill } : {}),
+		...(reviewer !== undefined ? { reviewer } : {}),
+		...(assignee !== undefined ? { assignee } : {}),
+		...(label !== undefined ? { label } : {}),
+	};
 }
 
 export interface PrCreateDeps {

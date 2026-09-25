@@ -170,6 +170,8 @@ function detectOne(segment: string): GhMutationTarget | null {
 export interface GhMutationInvalidatorDeps {
 	cache: GithubCache;
 	env: NodeJS.ProcessEnv;
+	/** Live feature gate; disabled integration skips parsing and cache probes. */
+	githubEnabled?: () => boolean;
 	git: GitRunner;
 	/** Overridable current-repo resolution (tests). */
 	resolveCurrentRepo?: typeof resolveCurrentGithubRepo;
@@ -196,6 +198,7 @@ export function createGhMutationInvalidator(
 
 	return {
 		async observe(command) {
+			if (deps.githubEnabled && !deps.githubEnabled()) return 0;
 			const mutations = detectGhMutations(command);
 			if (mutations.length === 0) return 0;
 			for (const mutation of mutations) {

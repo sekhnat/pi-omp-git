@@ -9,6 +9,7 @@
  * github.com (§50).
  */
 
+import { type Static, Type } from "typebox";
 import {
 	AuthenticationError,
 	DependencyError,
@@ -25,12 +26,34 @@ import {
 } from "../../shared/subprocess.ts";
 import { parseGithubRepoIdentifier } from "../repo.ts";
 import type { GhRunner } from "../runner.ts";
-
+import { optionalNonEmptyString } from "./params.ts";
 export interface RepoViewTarget {
 	/** `owner/repo` or `host/owner/repo`; omitted → gh resolves the checkout. */
 	repo?: string;
 	/** Requested branch, echoed in the result when given (§20). */
 	branch?: string;
+}
+
+export const REPO_VIEW_OPERATION_PARAMETERS = Type.Object({
+	op: Type.Literal("repo_view"),
+	repo: Type.Optional(Type.String()),
+	branch: Type.Optional(Type.String()),
+});
+
+export type RepoViewOperationArguments = Static<
+	typeof REPO_VIEW_OPERATION_PARAMETERS
+>;
+
+export function validateRepoViewOperationArguments(
+	params: Record<string, unknown>,
+): RepoViewOperationArguments {
+	const repo = optionalNonEmptyString(params, "repo");
+	const branch = optionalNonEmptyString(params, "branch");
+	return {
+		op: "repo_view",
+		...(repo !== undefined ? { repo } : {}),
+		...(branch !== undefined ? { branch } : {}),
+	};
 }
 
 export interface RepoView {
