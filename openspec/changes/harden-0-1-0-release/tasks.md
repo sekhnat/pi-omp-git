@@ -24,9 +24,9 @@
 ## 3. Automated checks and packed-package validation
 
 - [x] 3.1 Add `npm run check` for typecheck, Biome, and Vitest and make temporary-Git test configuration portable; verify the canonical command succeeds locally with `npm ci`.
-- [ ] 3.2 Add push/PR GitHub Actions CI on Node 22 using `npm ci`, `npm run check`, and a maintainable Linux/macOS matrix for Git-sensitive verification; verify workflow syntax and successful checks on both platforms.
+- [x] 3.2 Add push/PR GitHub Actions CI on Node 22 using `npm ci`, `npm run check`, and a maintainable Linux/macOS matrix for Git-sensitive verification; verify workflow syntax and successful checks on both platforms.
 - [x] 3.3 Implement `npm run smoke:pack` to pack, inspect, install in an isolated fixture with declared Pi peers, load the Pi extension via a supported Pi loader, invoke CLI `--help`, and clean up; verify it fails if a peer or published entrypoint is removed and passes for the actual tarball.
-- [ ] 3.4 Run the canonical check and tarball smoke in CI after the manifest work; verify the CI workflow uses the same local commands and does not require GitHub network access for ordinary tests.
+- [x] 3.4 Run the canonical check and tarball smoke in CI after the manifest work; verify the CI workflow uses the same local commands and does not require GitHub network access for ordinary tests.
 
 ## 4. Diagnostics and dispatcher boundaries
 
