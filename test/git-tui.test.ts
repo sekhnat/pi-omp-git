@@ -19,7 +19,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGitRunner, type GitRunner } from "../src/git/runner.ts";
 import {
 	buildGitUiState,
@@ -210,14 +210,16 @@ describe("interactive operations through the component", () => {
 		);
 		component.handleInput("s");
 		// Wait for the async mutation + refresh.
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		const status = git(["status", "--porcelain=v2"], repo.path);
-		expect(status).toContain("1 M. ");
+		await vi.waitFor(() => {
+			expect(controller.state.staged.map((file) => file.path)).toContain(
+				"f.txt",
+			);
+		});
 		// Unstage again.
 		component.handleInput("u");
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		const status2 = git(["status", "--porcelain=v2"], repo.path);
-		expect(status2).toContain("1 .M ");
+		await vi.waitFor(() => {
+			expect(git(["status", "--porcelain=v2"], repo.path)).toContain("1 .M ");
+		});
 		expect(renderCount).toBeGreaterThan(0);
 	});
 
@@ -259,8 +261,9 @@ describe("interactive operations through the component", () => {
 		);
 		component.handleInput("d");
 		component.handleInput("y");
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		expect(git(["status", "--porcelain=v2"], repo.path).trim()).toBe("");
+		await vi.waitFor(() => {
+			expect(git(["status", "--porcelain=v2"], repo.path).trim()).toBe("");
+		});
 	});
 
 	it("deletes an untracked file only after confirmation", async () => {
@@ -278,8 +281,9 @@ describe("interactive operations through the component", () => {
 			"Delete untracked file temp.txt",
 		);
 		component.handleInput("y");
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		expect(existsSync(join(repo.path, "temp.txt"))).toBe(false);
+		await vi.waitFor(() => {
+			expect(existsSync(join(repo.path, "temp.txt"))).toBe(false);
+		});
 	});
 
 	it("stages and unstages individual hunks in hunk mode", async () => {
@@ -297,21 +301,26 @@ describe("interactive operations through the component", () => {
 		component.handleInput("h");
 		expect(controller.hunkMode).toBe(true);
 		component.handleInput("s");
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		expect(git(["diff", "--cached", "--", "f.txt"], repo.path)).toContain("+B");
-		expect(git(["diff", "--cached", "--", "f.txt"], repo.path)).not.toContain(
-			"+L",
-		);
+		await vi.waitFor(() => {
+			expect(git(["diff", "--cached", "--", "f.txt"], repo.path)).toContain(
+				"+B",
+			);
+			expect(git(["diff", "--cached", "--", "f.txt"], repo.path)).not.toContain(
+				"+L",
+			);
+		});
 		// Unstage the second hunk after switching to the staged side.
 		controller.switchArea();
 		await controller.loadDiff();
 		component.handleInput("h");
 		controller.moveHunk(1);
 		component.handleInput("u");
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		const staged = git(["diff", "--cached", "--", "f.txt"], repo.path);
-		expect(staged).not.toContain("+L");
-		expect(git(["diff", "--", "f.txt"], repo.path)).toContain("+L");
+		await vi.waitFor(() => {
+			expect(git(["diff", "--cached", "--", "f.txt"], repo.path)).not.toContain(
+				"+L",
+			);
+			expect(git(["diff", "--", "f.txt"], repo.path)).toContain("+L");
+		});
 	});
 
 	it("discards a single hunk after confirmation", async () => {
@@ -331,10 +340,11 @@ describe("interactive operations through the component", () => {
 		component.handleInput("d");
 		expect(controller.pendingConfirm?.prompt).toContain("Discard hunk 2");
 		component.handleInput("y");
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		const unstaged = git(["diff", "--", "f.txt"], repo.path);
-		expect(unstaged).toContain("+B");
-		expect(unstaged).not.toContain("+L");
+		await vi.waitFor(() => {
+			const unstaged = git(["diff", "--", "f.txt"], repo.path);
+			expect(unstaged).toContain("+B");
+			expect(unstaged).not.toContain("+L");
+		});
 	});
 
 	it("protects conflicted files from stage and discard (§64)", async () => {

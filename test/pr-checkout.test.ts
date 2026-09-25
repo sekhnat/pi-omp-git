@@ -13,6 +13,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	realpathSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -230,10 +231,7 @@ describe("pr_checkout: single PR into a managed worktree", () => {
 		expect(primaryHead(work).sha).toBe(baseSha);
 
 		// The worktree exists under the configured root with parity naming.
-		const expectedName = worktreeName(
-			418,
-			before.sha === baseSha ? work : work,
-		);
+		const expectedName = worktreeName(418, realpathSync(work));
 		const worktreePath = join(worktreeRoot, expectedName);
 		expect(existsSync(worktreePath)).toBe(true);
 		expect(git(["rev-parse", "HEAD"], worktreePath).trim()).toBe(prHead);
@@ -443,7 +441,7 @@ describe("pr_checkout: single PR into a managed worktree", () => {
 		};
 		// The existing worktree (at an unrelated path) is the one reused —
 		// the branch already existed at the correct SHA.
-		expect(details.worktreePath).toBe(manualPath);
+		expect(details.worktreePath).toBe(realpathSync(manualPath));
 		expect(details.reused).toBe(true);
 	});
 
@@ -457,7 +455,7 @@ describe("pr_checkout: single PR into a managed worktree", () => {
 
 		const work = makeClone(bare.path, "primary");
 		const worktreeRoot = tempDir("pi-omp-git-wt-");
-		const preferred = join(worktreeRoot, worktreeName(27, work));
+		const preferred = join(worktreeRoot, worktreeName(27, realpathSync(work)));
 		mkdirSync(preferred, { recursive: true });
 		writeFileSync(join(preferred, "occupied"), "x");
 
@@ -636,7 +634,9 @@ describe("pr_checkout: serialization and details", () => {
 		expect(details.url).toBe("https://github.com/owner/repo/pull/50");
 		expect(details.prBranch).toBe("pr-50");
 		expect(details.worktreePath).toContain(worktreeRoot);
-		expect(details.worktreePath).toContain(worktreeName(50, work));
+		expect(details.worktreePath).toContain(
+			worktreeName(50, realpathSync(work)),
+		);
 		expect(details.reused).toBe(false);
 	});
 });

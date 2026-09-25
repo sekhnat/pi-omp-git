@@ -11,6 +11,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -93,7 +94,7 @@ describe("clean repository", () => {
 	it("reports no staged, unstaged, or conflicted files, with branch and HEAD", async () => {
 		const repo = initRepo();
 		const s = await state(repo);
-		expect(s.root).toBe(repo.path);
+		expect(s.root).toBe(realpathSync(repo.path));
 		expect(s.branch).toBe("main");
 		expect(s.head).toMatch(/^[0-9a-f]{40}$/);
 		expect(s.staged).toEqual([]);
@@ -370,7 +371,7 @@ describe("state refresh (§62)", () => {
 			{ git: repo.git },
 			join(repo.path, "sub"),
 		);
-		expect(raw.root).toBe(repo.path);
+		expect(raw.root).toBe(realpathSync(repo.path));
 		const s = buildGitUiState(raw);
 		expect(s.unstaged.map((f) => f.path)).toEqual(["sub/nested.txt"]);
 	});
