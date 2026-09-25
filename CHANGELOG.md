@@ -60,3 +60,9 @@ First public candidate release. Version not yet published; see
   pinned development versions; package metadata (repository, bugs, homepage).
 - `docs/pi-omp-git-reference.md` section index and
   `docs/adr/0004-shared-commit-hosts.md`.
+- Git-source installs now deliver the companion CLI alongside the extension:
+  the `bin/pi-omp-git.mjs` launcher prefers compiled `dist/` output, falls
+  back to the TypeScript sources (including a resolve hook that maps host
+  packages into the user's Pi installation when the installed tree has an
+  empty `node_modules`), and a defensive `prepare` script builds `dist`
+  only when dev dependencies are installed.

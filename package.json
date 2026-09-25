@@ -31,7 +31,8 @@
 		"typecheck": "tsc --noEmit",
 		"lint": "biome check .",
 		"prepack": "npm run build",
-		"smoke:pack": "node scripts/smoke-pack.mjs"
+		"smoke:pack": "node scripts/smoke-pack.mjs",
+		"prepare": "node scripts/prepare.mjs"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-agent-core": "*",

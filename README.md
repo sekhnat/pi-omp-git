@@ -28,7 +28,29 @@ For one Pi invocation without saving a package declaration:
 pi -e /absolute/path/to/pi-omp-git
 ```
 
-The package manifest points Pi at `src/index.ts`. If you are working from this repository rather than an installed package, first install its dependencies with `npm ci`. Pi's package installation and the standalone executable are distinct: **do not assume `pi install` adds `pi-omp-git` to your shell's `PATH`**. See [Companion CLI](#companion-cli) for running it from the checkout.
+The package manifest points Pi at `src/index.ts`. If you are working from this repository rather than an installed package, first install its dependencies with `npm ci`. **Do not assume `pi install` adds `pi-omp-git` to your shell's `PATH`** — see the git-source section above for `PATH` setup, and [Companion CLI](#companion-cli) for the launcher's resolution behavior.
+
+### Installing from GitHub (git source)
+
+```sh
+pi install https://github.com/sekhnat/pi-omp-git
+```
+
+This clones the repository into Pi's managed install directory and delivers both faces of the package: the **Pi extension** (`src/index.ts`, loaded by Pi itself) and the **companion CLI** (`bin/pi-omp-git.mjs`), which runs without a build step — the launcher prefers compiled `dist/` output when present and otherwise runs the TypeScript sources, resolving the host Pi packages from your Pi installation when the installed tree does not contain them.
+
+`pi install` never modifies your shell `PATH`. To run `pi-omp-git` from anywhere, either create a global-style install (its `prepare` step builds `dist/`):
+
+```sh
+npm install -g git+https://github.com/sekhnat/pi-omp-git.git
+```
+
+or point your shell at the Pi-installed clone once — an alias or a single symlink into `~/.local/bin`. The alias form keeps the CLI version-locked to the extension, because `pi update` moves both:
+
+```sh
+alias pi-omp-git='node "$HOME/.pi/agent/git/github.com/sekhnat/pi-omp-git/bin/pi-omp-git.mjs"'
+```
+
+Adjust the path when `PI_CODING_AGENT_DIR` is set: the clone lives under `<agent dir>/git/<host>/<owner>/<repo>`.
 
 In Pi, try `/omp-git-doctor` to report whether `git` and `gh` are available/authenticated. Probes and the GitHub cache open lazily, not when the extension loads.
 
@@ -185,7 +207,7 @@ All search operations require nonempty `query` using GitHub search syntax. Optio
 
 ## Companion CLI
 
-The standalone entry point is `bin/pi-omp-git.mjs`. After installing this checkout's dependencies, run it with Node, or use `pi-omp-git` if you separately installed the npm package in a way that exposes its `bin` entry:
+The standalone entry point is `bin/pi-omp-git.mjs`, and the launcher needs no build step on any install path. It resolves the CLI through three tiers: compiled `dist/cli.js` when present (what packed tarballs and `npm install -g git+…` installs use, because Node refuses to import TypeScript from `node_modules`), then the TypeScript `src/cli.ts` directly (fresh checkouts after `npm ci`), then `src/cli.ts` again with the host Pi packages resolved from your Pi installation (Pi's git installs leave the clone's `node_modules` empty). Each engaged fallback tier prints a one-line notice on stderr; stdout and exit codes are unaffected. When neither the installed tree nor a discoverable Pi installation provides a host package, the launch fails with an error naming it. In a working checkout, rebuild after pulling source changes (`npm run build`) so a stale `dist/` does not shadow the newer sources — or run the CLI from any of the install paths above:
 
 ```sh
 node ./bin/pi-omp-git.mjs --help
